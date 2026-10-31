@@ -8,6 +8,7 @@ from langchain.messages import HumanMessage
 
 from agent import agent
 from tracing import ToolTraceCallback, write_agent_trace
+from retry import build_agent_input
 
 
 # ---------------------------------------------------------
@@ -68,6 +69,7 @@ def initialize_session():
         "show_tool_details": False,
         "trace_warning": False,
         "pending_prompt": None,
+        "pending_operation": None,
     }
 
     for key, value in defaults.items():
@@ -76,6 +78,9 @@ def initialize_session():
 
 
 def start_new_conversation():
+    if st.session_state.pending_operation is not None:
+        return
+
     st.session_state.thread_id = str(uuid4())
     st.session_state.turn_number = 0
     st.session_state.messages = initial_messages()
@@ -83,6 +88,7 @@ def start_new_conversation():
     st.session_state.conversation_closed = False
     st.session_state.trace_warning = False
     st.session_state.pending_prompt = None
+    st.session_state.pending_operation = None
 
 
 def queue_prompt(prompt):
@@ -97,36 +103,43 @@ initialize_session()
 # ---------------------------------------------------------
 
 
-def process_message(user_text):
-    if (
-        st.session_state.conversation_closed
-        or st.session_state.turn_number >= MAX_CONVERSATION_TURNS
-    ):
+def execute_pending_operation():
+    pending = st.session_state.pending_operation
+
+    if not isinstance(pending, dict):
         return
 
-    user_text = user_text.strip()
-
-    if not user_text:
-        return
-
-    st.session_state.messages.append({"role": "user", "content": user_text})
-
-    st.session_state.turn_number += 1
-
+    user_text = pending["user_text"]
+    request_id = pending["refund_request_id"]
     thread_id = st.session_state.thread_id
-    turn_number = st.session_state.turn_number
+    turn_number = pending["turn_number"]
+
+    error_message = (
+        "I encountered a technical issue while processing your request. "
+        "The outcome could not be confirmed. You can retry below using "
+        "the same request identifier."
+    )
+
+    # Remove the previous retry error before attempting again.
+    if (
+        pending.get("failed")
+        and st.session_state.messages
+        and st.session_state.messages[-1]
+        == {"role": "assistant", "content": error_message}
+    ):
+        st.session_state.messages.pop()
+
+    is_retry = bool(pending.get("failed"))
+    pending["failed"] = False
 
     callback = ToolTraceCallback()
     started = perf_counter()
-
     response = None
     error = None
 
     try:
         config = {
-            "configurable": {
-                "thread_id": thread_id,
-            },
+            "configurable": {"thread_id": thread_id},
             "metadata": {
                 "thread_id": thread_id,
                 "turn_number": turn_number,
@@ -135,13 +148,35 @@ def process_message(user_text):
             "callbacks": [callback],
         }
 
-        response = agent.invoke(
-            {"messages": [HumanMessage(content=user_text)]},
-            config=config,
+        graph_input = build_agent_input(
+            agent,
+            config,
+            is_retry=is_retry,
+            user_text=user_text,
+            request_id=request_id,
         )
 
-        structured = response.get("structured_response")
+        if isinstance(graph_input, dict) and "messages" in graph_input:
+            # First attempt: submit the original user message.
+            response = agent.invoke(
+                graph_input,
+                config=config,
+                context={"refund_request_id": request_id},
+            )
 
+        elif graph_input is None:
+            # Interrupted graph: resume the existing checkpoint.
+            response = agent.invoke(
+                None,
+                config=config,
+                context={"refund_request_id": request_id},
+            )
+
+        else:
+            # Completed graph: recover its saved response without rerunning.
+            response = {"structured_response": graph_input}
+
+        structured = response.get("structured_response")
         if structured is None:
             raise ValueError("Agent did not return a structured response.")
 
@@ -158,33 +193,29 @@ def process_message(user_text):
         if not isinstance(should_continue, bool):
             raise ValueError("The conversation field must be a boolean.")
 
-        st.session_state.messages.append({"role": "assistant", "content": answer})
+        st.session_state.messages.append(
+            {"role": "assistant", "content": answer}
+        )
+
+        # Clear the pending operation only after a valid response.
+        st.session_state.pending_operation = None
 
         if not should_continue:
             st.session_state.conversation_closed = True
 
     except Exception as exc:
         error = exc
-
         logger.exception(
             "Agent failed: thread=%s turn=%s",
             thread_id,
             turn_number,
         )
 
+        # Preserve the original message and request ID.
+        pending["failed"] = True
         st.session_state.messages.append(
-            {
-                "role": "assistant",
-                "content": (
-                    "I encountered a technical issue while processing "
-                    "your request. I cannot confirm whether the operation "
-                    "completed. Please contact support before retrying "
-                    "any action that may already have been submitted."
-                ),
-            }
+            {"role": "assistant", "content": error_message}
         )
-
-        st.session_state.conversation_closed = True
 
     elapsed = perf_counter() - started
 
@@ -209,9 +240,7 @@ def process_message(user_text):
             thread_id,
             turn_number,
         )
-
         st.session_state.trace_warning = True
-
         st.session_state.trace_records.append(
             {
                 "trace_id": f"local-{uuid4()}",
@@ -226,8 +255,39 @@ def process_message(user_text):
             }
         )
 
-    if st.session_state.turn_number >= MAX_CONVERSATION_TURNS:
+    if (
+        st.session_state.pending_operation is None
+        and turn_number >= MAX_CONVERSATION_TURNS
+    ):
         st.session_state.conversation_closed = True
+
+
+def process_message(user_text):
+    if (
+        st.session_state.conversation_closed
+        or st.session_state.turn_number >= MAX_CONVERSATION_TURNS
+        or st.session_state.pending_operation is not None
+    ):
+        return
+
+    user_text = user_text.strip()
+    if not user_text:
+        return
+
+    st.session_state.messages.append(
+        {"role": "user", "content": user_text}
+    )
+    st.session_state.turn_number += 1
+
+    # One ID per operation, retained for every retry.
+    st.session_state.pending_operation = {
+        "user_text": user_text,
+        "refund_request_id": str(uuid4()),
+        "turn_number": st.session_state.turn_number,
+        "failed": False,
+    }
+
+    execute_pending_operation()
 
 
 # ---------------------------------------------------------
@@ -790,7 +850,12 @@ def render_trace(record, expanded=False):
 # Session status
 # ---------------------------------------------------------
 
-turn_limit_reached = st.session_state.turn_number >= MAX_CONVERSATION_TURNS
+pending_operation = st.session_state.pending_operation
+
+turn_limit_reached = (
+    st.session_state.turn_number >= MAX_CONVERSATION_TURNS
+    and pending_operation is None
+)
 
 if turn_limit_reached:
     st.session_state.conversation_closed = True
@@ -812,6 +877,7 @@ with st.sidebar:
         "New conversation",
         type="primary",
         use_container_width=True,
+        disabled=st.session_state.pending_operation is not None,
         on_click=start_new_conversation,
     )
 
@@ -909,6 +975,7 @@ if st.session_state.trace_warning:
 conversation_column, trace_column = st.columns([1.6, 1], gap="medium")
 
 user_input = None
+retry_clicked = False
 
 with conversation_column:
     with st.container(border=True):
@@ -937,14 +1004,33 @@ with conversation_column:
                         args=(prompt,),
                     )
 
+        if st.session_state.pending_operation is not None:
+            st.warning(
+                "A previous request has an unconfirmed outcome. "
+                "Retry it before submitting another request."
+            )
+            retry_clicked = st.button(
+                "Retry previous request",
+                key="retry_pending_operation",
+                type="primary",
+                use_container_width=True,
+            )
+
         user_input = st.chat_input(
             "Describe your order issue",
             key="refund_message",
-            disabled=closed,
+            disabled=(
+                closed
+                or st.session_state.pending_operation is not None
+            ),
             max_chars=1000,
         )
 
-        if turn_limit_reached:
+        if st.session_state.pending_operation is not None:
+            st.caption(
+                "Retry reuses the original request ID and conversation turn."
+            )
+        elif turn_limit_reached:
             st.caption("Turn limit reached. Start a new conversation to continue.")
         elif closed:
             st.caption("This conversation is closed. Start a new one to continue.")
@@ -984,7 +1070,18 @@ with trace_column:
 prompt = user_input or st.session_state.pending_prompt
 st.session_state.pending_prompt = None
 
-if prompt and prompt.strip() and not closed:
+if retry_clicked:
+    with st.spinner("Retrying the original request..."):
+        execute_pending_operation()
+
+    st.rerun()
+
+elif (
+    prompt
+    and prompt.strip()
+    and not closed
+    and st.session_state.pending_operation is None
+):
     with st.spinner("Reviewing your request..."):
         process_message(prompt)
 

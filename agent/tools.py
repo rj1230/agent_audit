@@ -5,8 +5,11 @@ from pathlib import Path
 from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 
-from langchain.tools import tool
+from langchain.tools import ToolRuntime, tool
 from dotenv import load_dotenv
+
+from agent_context import AgentContext
+from ticket_store import create_or_get_ticket, get_existing_ticket
 
 from objects import PurchaseItem
 
@@ -152,12 +155,38 @@ def calculate_right_refund(
 def issue_refund_ticket(
     user: str,
     items: list[PurchaseItem],
+    runtime: ToolRuntime[AgentContext],
 ) -> dict:
-    """Revalidate eligibility and issue a simulated refund ticket."""
+    """Revalidate eligibility and issue an idempotent simulated refund ticket."""
 
     logging.info("Processing refund ticket for %s", user)
 
-    # Never trust a refund amount supplied by the LLM.
+    context = runtime.context
+    request_id = (
+        context.get("refund_request_id")
+        if isinstance(context, dict)
+        else None
+    )
+
+    if not isinstance(request_id, str) or not request_id.strip():
+        logging.error("Refund ticket rejected: missing request context.")
+        return {
+            "ticket_issued": False,
+            "reason": "missing_request_id",
+        }
+
+    # Recover an already-issued ticket before checking today's eligibility.
+    # This allows a legitimate retry after the original refund window expires.
+    existing = get_existing_ticket(
+        request_id=request_id,
+        user=user,
+        item_names=[item.name for item in items],
+    )
+
+    if existing is not None:
+        return existing
+
+    # New tickets must always pass current deterministic eligibility checks.
     result = validate_refund(user, items)
 
     if not result["eligible"]:
@@ -166,16 +195,14 @@ def issue_refund_ticket(
             "reason": result["reason"],
         }
 
-    # Simulated ticket creation for this portfolio project.
-    # A real implementation would persist the ticket or call a
-    # refund-service API here.
-    return {
-        "ticket_issued": True,
-        "user": user,
-        "items": result["items"],
-        "refund_amount": result["refund_amount"],
-        "status": "success",
-    }
+    # The store performs a second idempotency check inside its write
+    # transaction, protecting against concurrent requests.
+    return create_or_get_ticket(
+        request_id=request_id,
+        user=user,
+        items=result["items"],
+        refund_amount=result["refund_amount"],
+    )
 
 
 @tool

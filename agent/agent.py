@@ -8,6 +8,7 @@ from langchain.messages import HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from models import model
+from agent_context import AgentContext
 from tools import (
     calculate_right_refund,
     get_today_date,
@@ -41,6 +42,7 @@ agent = create_agent(
         get_today_date,
     ],
     response_format=Answer,
+    context_schema=AgentContext,
     checkpointer=InMemorySaver(),
 )
 
@@ -90,6 +92,9 @@ def run_conversation(initial_message=None):
                 config={
                     **config,
                     "callbacks": [tool_callback],
+                },
+                context={
+                    "refund_request_id": str(uuid4()),
                 },
             )
 
