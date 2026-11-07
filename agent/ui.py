@@ -1,13 +1,25 @@
 import logging
+import sys
 from html import escape
-from time import perf_counter
+from pathlib import Path
 from uuid import uuid4
 
-import streamlit as st
-from langchain.messages import HumanMessage
+# Ensure the repository root wins over Streamlit's script-directory path.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
-from agent import agent
-from tracing import ToolTraceCallback, write_agent_trace
+import streamlit as st
+
+from agent.agent import agent
+from agent.tracing import ToolTraceCallback, write_agent_trace
+from agent.retry import build_agent_input
+from agent.execution import run_pending_operation
+from agent.approval import (
+    confirm_pending_approval as confirm_approval,
+    decline_pending_approval as decline_approval,
+)
+from agent.objects import PurchaseItem
+from agent.tools import issue_approved_refund_ticket
 
 
 # ---------------------------------------------------------
@@ -15,7 +27,7 @@ from tracing import ToolTraceCallback, write_agent_trace
 # ---------------------------------------------------------
 
 st.set_page_config(
-    page_title="AgentAudit | Refund support",
+    page_title="AgentAudit | Refund operations",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -25,14 +37,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 MAX_CONVERSATION_TURNS = 8
-
-# Height of the scrolling area inside each panel (pixels).
-# The trace panel has no chat input under it, so it gets a little extra
-# height to make both panels end at the same line. Tweak TRACE_EXTRA_HEIGHT
-# by a few pixels if your browser zoom makes them slightly uneven.
-CHAT_BODY_HEIGHT = 400
-TRACE_EXTRA_HEIGHT = 64
-TRACE_BODY_HEIGHT = CHAT_BODY_HEIGHT + TRACE_EXTRA_HEIGHT
+PANEL_BODY_HEIGHT = 400  # decision inspector and execution trace bodies
+CHAT_BODY_HEIGHT = 330  # leaves room for the chat input beneath the transcript
 
 WELCOME_MESSAGE = (
     "Hello! I can help you review a purchase and request a refund.\n\n"
@@ -68,6 +74,8 @@ def initialize_session():
         "show_tool_details": False,
         "trace_warning": False,
         "pending_prompt": None,
+        "pending_operation": None,
+        "pending_approval": None,
     }
 
     for key, value in defaults.items():
@@ -76,6 +84,12 @@ def initialize_session():
 
 
 def start_new_conversation():
+    if (
+        st.session_state.pending_operation is not None
+        or st.session_state.pending_approval is not None
+    ):
+        return
+
     st.session_state.thread_id = str(uuid4())
     st.session_state.turn_number = 0
     st.session_state.messages = initial_messages()
@@ -83,6 +97,8 @@ def start_new_conversation():
     st.session_state.conversation_closed = False
     st.session_state.trace_warning = False
     st.session_state.pending_prompt = None
+    st.session_state.pending_operation = None
+    st.session_state.pending_approval = None
 
 
 def queue_prompt(prompt):
@@ -93,184 +109,109 @@ initialize_session()
 
 
 # ---------------------------------------------------------
-# Agent execution (unchanged behaviour)
+# Agent execution — intentionally preserved
 # ---------------------------------------------------------
+
+
+def execute_pending_operation():
+    return run_pending_operation(
+        session_state=st.session_state,
+        agent=agent,
+        callback_factory=ToolTraceCallback,
+        trace_writer=write_agent_trace,
+        input_builder=build_agent_input,
+        logger=logger,
+        max_conversation_turns=MAX_CONVERSATION_TURNS,
+    )
 
 
 def process_message(user_text):
     if (
         st.session_state.conversation_closed
         or st.session_state.turn_number >= MAX_CONVERSATION_TURNS
+        or st.session_state.pending_operation is not None
+        or st.session_state.pending_approval is not None
     ):
         return
 
     user_text = user_text.strip()
-
     if not user_text:
         return
 
     st.session_state.messages.append({"role": "user", "content": user_text})
-
     st.session_state.turn_number += 1
 
-    thread_id = st.session_state.thread_id
-    turn_number = st.session_state.turn_number
+    # One ID per operation, retained for every retry.
+    st.session_state.pending_operation = {
+        "user_text": user_text,
+        "refund_request_id": str(uuid4()),
+        "turn_number": st.session_state.turn_number,
+        "failed": False,
+    }
 
-    callback = ToolTraceCallback()
-    started = perf_counter()
+    execute_pending_operation()
 
-    response = None
-    error = None
 
-    try:
-        config = {
-            "configurable": {
-                "thread_id": thread_id,
-            },
-            "metadata": {
-                "thread_id": thread_id,
-                "turn_number": turn_number,
-                "application": "agent-audit-streamlit",
-            },
-            "callbacks": [callback],
-        }
+def confirm_pending_approval():
+    """Streamlit callback for explicitly confirming a refund quote."""
+    confirm_approval(
+        st.session_state,
+        ticket_issuer=issue_approved_refund_ticket,
+        logger=logger,
+    )
 
-        response = agent.invoke(
-            {"messages": [HumanMessage(content=user_text)]},
-            config=config,
-        )
-
-        structured = response.get("structured_response")
-
-        if structured is None:
-            raise ValueError("Agent did not return a structured response.")
-
-        if isinstance(structured, dict):
-            answer = structured["answer"]
-            should_continue = structured["conversation"]
-        else:
-            answer = structured.answer
-            should_continue = structured.conversation
-
-        if not isinstance(answer, str) or not answer.strip():
-            raise ValueError("Agent returned an invalid answer.")
-
-        if not isinstance(should_continue, bool):
-            raise ValueError("The conversation field must be a boolean.")
-
-        st.session_state.messages.append({"role": "assistant", "content": answer})
-
-        if not should_continue:
-            st.session_state.conversation_closed = True
-
-    except Exception as exc:
-        error = exc
-
-        logger.exception(
-            "Agent failed: thread=%s turn=%s",
-            thread_id,
-            turn_number,
-        )
-
-        st.session_state.messages.append(
-            {
-                "role": "assistant",
-                "content": (
-                    "I encountered a technical issue while processing "
-                    "your request. I cannot confirm whether the operation "
-                    "completed. Please contact support before retrying "
-                    "any action that may already have been submitted."
-                ),
-            }
-        )
-
-        st.session_state.conversation_closed = True
-
-    elapsed = perf_counter() - started
-
-    try:
-        trace_record = write_agent_trace(
-            thread_id=thread_id,
-            turn_number=turn_number,
-            elapsed_seconds=elapsed,
-            tool_callback=callback,
-            response=response,
-            error=error,
-        )
-
-        if not isinstance(trace_record, dict):
-            raise TypeError("write_agent_trace must return a dictionary.")
-
-        st.session_state.trace_records.append(trace_record)
-
-    except Exception:
-        logger.exception(
-            "Failed to persist trace: thread=%s turn=%s",
-            thread_id,
-            turn_number,
-        )
-
-        st.session_state.trace_warning = True
-
-        st.session_state.trace_records.append(
-            {
-                "trace_id": f"local-{uuid4()}",
-                "turn_number": turn_number,
-                "execution_time_seconds": elapsed,
-                "status": "error" if error else "completed",
-                "tool_call_count": 0,
-                "successful_tool_count": 0,
-                "failed_tool_count": 0,
-                "tool_events": [],
-                "trace_unavailable": True,
-            }
-        )
-
-    if st.session_state.turn_number >= MAX_CONVERSATION_TURNS:
-        st.session_state.conversation_closed = True
+def decline_pending_approval():
+    """Discard the pending quote without issuing a ticket."""
+    decline_approval(st.session_state)
 
 
 # ---------------------------------------------------------
-# Styles
+# Theme
 # ---------------------------------------------------------
 
 st.markdown(
     """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
 
 :root {
-    --aa-bg: #0C1116;
-    --aa-surface: #131A21;
-    --aa-raised: #19222B;
-    --aa-border: #25303B;
-    --aa-border-strong: #33414F;
-    --aa-text: #E4E9EE;
-    --aa-muted: #8795A4;
-    --aa-accent: #5EB5C4;
-    --aa-accent-ink: #08242A;
-    --aa-ok: #62C48F;
-    --aa-warn: #E2B65A;
-    --aa-err: #E57B72;
+    color-scheme: dark;
+    --aa-bg: #080E16;
+    --aa-sidebar: #0C1520;
+    --aa-surface: #101B28;
+    --aa-surface-2: #142233;
+    --aa-surface-3: #192B3E;
+    --aa-border: #25384B;
+    --aa-border-soft: #1D2D3D;
+    --aa-text: #EAF1F7;
+    --aa-muted: #91A4B8;
+    --aa-subtle: #7A8FA5;
+    --aa-teal: #55D6BE;
+    --aa-teal-dark: #123B3B;
+    --aa-green: #65D6A2;
+    --aa-amber: #E9B968;
+    --aa-red: #F08080;
+    --aa-blue: #85B8F5;
 }
 
-/* Base ------------------------------------------------- */
-html, body, .stApp,
-[data-testid="stMarkdownContainer"],
-[data-testid="stCaptionContainer"],
-button, input, textarea {
-    font-family: 'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
+html, body, .stApp, [data-testid="stMarkdownContainer"],
+[data-testid="stCaptionContainer"], button, input, textarea {
+    font-family: 'IBM Plex Sans', system-ui, sans-serif;
 }
 
-[data-testid="stAppViewContainer"] {
+* { scrollbar-width: thin; scrollbar-color: #2A4156 transparent; }
+
+.stApp,
+[data-testid="stAppViewContainer"],
+[data-testid="stMain"] {
     background: var(--aa-bg);
+    color: var(--aa-text);
 }
 
-[data-testid="stHeader"] {
-    background: transparent;
-}
+/* Transparent header: it floats above the page, so the content below
+   needs enough top padding to stay clear of it. */
+[data-testid="stHeader"] { background: transparent; }
 
-/* Hide Streamlit chrome that doesn't belong in a product UI */
 [data-testid="stAppDeployButton"],
 [data-testid="stMainMenu"],
 [data-testid="stStatusWidget"],
@@ -279,341 +220,350 @@ footer {
 }
 
 .block-container {
-    max-width: 1360px;
-    padding-top: 2.75rem;
-    padding-bottom: 1rem;
+    max-width: 1480px;
+    padding-top: 3.6rem;
+    padding-bottom: 2rem;
 }
 
 [data-testid="stSidebar"] {
-    background: var(--aa-surface);
-    border-right: 1px solid var(--aa-border);
+    background: var(--aa-sidebar);
+    border-right: 1px solid var(--aa-border-soft);
 }
-
 [data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {
-    padding-top: 1.25rem;
+    padding-top: 1.2rem;
+}
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] {
+    font-size: 12px; line-height: 1.55;
 }
 
-/* Header ------------------------------------------------ */
-.aa-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    flex-wrap: wrap;
-    gap: 12px;
-    margin-bottom: 14px;
-}
-
-.aa-brand {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-}
-
-.aa-logo {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 38px;
-    height: 38px;
-    flex-shrink: 0;
-    border: 1px solid var(--aa-border-strong);
-    border-radius: 9px;
-    background: var(--aa-raised);
-    color: var(--aa-accent);
-}
-
-.aa-title {
+p, li, label, [data-testid="stMarkdownContainer"] {
     color: var(--aa-text);
-    font-size: 19px;
-    font-weight: 600;
-    letter-spacing: -0.2px;
-    line-height: 1.25;
+}
+[data-testid="stCaptionContainer"] {
+    color: var(--aa-muted) !important;
+    font-size: 12px; line-height: 1.5;
+}
+hr {
+    border-color: var(--aa-border-soft) !important;
 }
 
-.aa-subtitle {
-    margin-top: 2px;
-    color: var(--aa-muted);
-    font-size: 12.5px;
-    line-height: 1.4;
+/* Header: one compact row */
+.aa-topbar {
+    display:flex; align-items:center; justify-content:space-between;
+    gap:16px; flex-wrap:wrap; margin:0 0 16px 0;
 }
-
-.aa-header-pills {
-    display: flex;
-    align-items: center;
-    gap: 8px;
+.aa-brand { display:flex; align-items:center; gap:14px; }
+.aa-mark {
+    width:46px; height:46px; flex:none; display:flex; align-items:center;
+    justify-content:center; border-radius:13px;
+    color:var(--aa-teal); background:#123039;
+    border:1px solid #28505A;
 }
+.aa-brand-sub {
+    color:var(--aa-muted); font-size:10.5px; font-weight:600;
+    letter-spacing:.1em; text-transform:uppercase;
+}
+.aa-brand-sub b { color:var(--aa-teal); font-weight:700; letter-spacing:.12em; }
+.aa-page-title {
+    color:var(--aa-text); font-size:21px; font-weight:600;
+    letter-spacing:-.4px; margin-top:3px; line-height:1.25;
+}
+.aa-page-subtitle { color:var(--aa-muted); font-size:12.5px; margin-top:2px; }
+.aa-header-right { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
 
-/* Pills ------------------------------------------------- */
+/* Status pills */
 .aa-pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 7px;
-    padding: 3px 10px;
-    border: 1px solid var(--aa-border-strong);
-    border-radius: 999px;
-    background: var(--aa-surface);
-    color: var(--aa-muted);
-    font-size: 12px;
-    line-height: 1.5;
-    white-space: nowrap;
+    display:inline-flex; align-items:center; gap:7px;
+    padding:5px 10px; border-radius:999px;
+    border:1px solid var(--aa-border); background:var(--aa-surface);
+    color:var(--aa-muted); font-size:11px; font-weight:600;
+    white-space:nowrap;
 }
+.aa-dot { width:7px; height:7px; border-radius:50%; display:inline-block; background:var(--aa-subtle); flex:none; }
+.aa-dot-ok { background:var(--aa-green); }
+.aa-dot-warn { background:var(--aa-amber); }
+.aa-dot-err { background:var(--aa-red); }
+.aa-dot-info { background:var(--aa-blue); }
 
-.aa-dot {
-    display: inline-block;
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: var(--aa-muted);
-}
-
-.aa-dot-ok { background: var(--aa-ok); }
-.aa-dot-warn { background: var(--aa-warn); }
-.aa-dot-err { background: var(--aa-err); }
-
-/* Metrics strip ----------------------------------------- */
+/* Metric cards */
 .aa-metrics {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    margin-bottom: 16px;
-    border: 1px solid var(--aa-border);
-    border-radius: 12px;
-    background: var(--aa-surface);
+    display:grid; grid-template-columns:repeat(4,minmax(0,1fr));
+    gap:10px; margin:0 0 14px 0;
 }
-
 .aa-metric {
-    padding: 12px 18px;
-    border-left: 1px solid var(--aa-border);
+    min-width:0; padding:10px 14px 11px;
+    background:linear-gradient(145deg,#142233,#101B28);
+    border:1px solid var(--aa-border); border-radius:12px;
 }
-
-.aa-metric:first-child {
-    border-left: none;
-}
-
 .aa-metric-label {
-    color: var(--aa-muted);
-    font-size: 12px;
-    line-height: 1.3;
+    color:var(--aa-muted); font-size:10px; font-weight:600;
+    text-transform:uppercase; letter-spacing:.08em;
 }
-
+.aa-metric-body {
+    display:flex; align-items:baseline; flex-wrap:wrap;
+    gap:2px 10px; margin-top:4px;
+}
 .aa-metric-value {
-    margin-top: 3px;
-    color: var(--aa-text);
-    font-size: 21px;
-    font-weight: 600;
-    letter-spacing: -0.3px;
-    line-height: 1.25;
-    font-variant-numeric: tabular-nums;
+    color:var(--aa-text); font-size:22px; font-weight:600;
+    letter-spacing:-.5px; line-height:1.2;
+    font-variant-numeric:tabular-nums;
 }
+.aa-metric-value.ok { color:var(--aa-green); }
+.aa-metric-value.warn { color:var(--aa-amber); }
+.aa-metric-value.err { color:var(--aa-red); }
+.aa-metric-note { color:var(--aa-subtle); font-size:11px; }
 
-.aa-metric-note {
-    margin-top: 1px;
-    color: var(--aa-muted);
-    font-size: 11.5px;
-    line-height: 1.3;
+/* Panel surfaces: keyed containers (recent Streamlit) */
+[class*="st-key-panel_"] {
+    background:var(--aa-surface) !important;
+    border:1px solid var(--aa-border) !important;
+    border-radius:14px !important;
 }
-
-/* Panels ------------------------------------------------ */
-[data-testid="stVerticalBlockBorderWrapper"] {
-    border-color: var(--aa-border);
-    border-radius: 12px;
-    background: var(--aa-surface);
+/* Make the three panels share one height per row (best effort). */
+[data-testid="stColumn"]:has([class*="st-key-panel_"]) > [data-testid="stVerticalBlock"],
+[data-testid="stColumn"]:has([class*="st-key-panel_"]) > [data-testid="stVerticalBlock"] > [data-testid="stLayoutWrapper"],
+[class*="st-key-panel_"] {
+    height:100%;
 }
-
+a, a:visited { color:var(--aa-teal) !important; }
 .aa-panel-heading {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    padding-bottom: 8px;
-    border-bottom: 1px solid var(--aa-border);
+    display:flex; align-items:center; justify-content:space-between;
+    gap:10px; padding-bottom:12px; margin-bottom:8px;
+    border-bottom:1px solid var(--aa-border-soft);
+}
+.aa-panel-title { color:var(--aa-text); font-size:14px; font-weight:600; white-space:nowrap; }
+.aa-panel-kicker {
+    color:var(--aa-subtle); font-size:10px; font-weight:600;
+    letter-spacing:.09em; text-transform:uppercase; margin-bottom:4px;
+    white-space:nowrap;
+}
+.aa-section-label {
+    color:var(--aa-muted); font-size:10px; font-weight:700;
+    letter-spacing:.1em; text-transform:uppercase; margin:2px 0 6px;
 }
 
-.aa-panel-title {
-    color: var(--aa-text);
-    font-size: 14px;
-    font-weight: 600;
-    line-height: 1.2;
-}
-
-/* Chat -------------------------------------------------- */
+/* Chat */
 [data-testid="stChatMessage"] {
-    margin-bottom: 8px;
-    padding: 12px 14px;
-    border: 1px solid var(--aa-border);
-    border-radius: 10px;
-    background: var(--aa-raised);
+    background:var(--aa-surface-2);
+    border:1px solid var(--aa-border-soft);
+    border-radius:12px; padding:10px 12px;
 }
-
-[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
-    border-color: #26454D;
-    background: #14232A;
+[data-testid="stChatMessage"]:has(.aa-user-marker) {
+    background:#122833; border-color:#28505A;
 }
-
-[data-testid="stChatMessageAvatarAssistant"],
-[data-testid="stChatMessageAvatarUser"] {
-    border: 1px solid var(--aa-border-strong);
-    border-radius: 8px;
-    background: var(--aa-surface) !important;
-    color: var(--aa-accent) !important;
+/* Marker used only to tell user messages apart; takes no space. */
+[data-testid="stElementContainer"]:has(> .stMarkdown .aa-user-marker) {
+    display:none;
 }
-
-[data-testid="stChatMessage"] p {
-    color: var(--aa-text);
-    font-size: 14.5px;
-    line-height: 1.6;
+[data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] p {
+    color:var(--aa-text); font-size:13.5px; line-height:1.6;
 }
-
+[data-testid^="stChatMessageAvatar"] {
+    background:#123039 !important;
+    border:1px solid #28505A; border-radius:9px;
+}
+[data-testid^="stChatMessageAvatar"] * { color:var(--aa-teal) !important; }
 [data-testid="stChatInput"] {
-    border: 1px solid var(--aa-border-strong);
-    border-radius: 10px;
-    background: var(--aa-raised);
+    border:1px solid var(--aa-border) !important;
+    border-radius:12px !important; background:var(--aa-surface-2) !important;
 }
-
 [data-testid="stChatInput"]:focus-within {
-    border-color: var(--aa-accent);
+    border-color:var(--aa-teal) !important;
+    box-shadow:0 0 0 1px rgba(85,214,190,.12);
 }
+[data-testid="stChatInput"] textarea { color:var(--aa-text) !important; }
 
-/* Buttons ----------------------------------------------- */
-.stButton > button,
-[data-testid="stBaseButton-secondary"],
-[data-testid="stBaseButton-primary"] {
-    min-height: 38px;
-    border-radius: 8px;
-    font-size: 13px;
-    font-weight: 500;
+/* Buttons */
+.stButton > button {
+    min-height:38px; border-radius:9px;
+    font-size:12.5px; font-weight:600;
+    transition:all .15s ease;
 }
-
 .stButton > button[kind="secondary"],
 [data-testid="stBaseButton-secondary"] {
-    justify-content: flex-start;
-    border: 1px solid var(--aa-border-strong);
-    background: var(--aa-raised);
-    color: var(--aa-text);
-    text-align: left;
+    background:#172638 !important; color:var(--aa-text) !important;
+    border:1px solid var(--aa-border) !important;
 }
-
 .stButton > button[kind="secondary"]:hover,
 [data-testid="stBaseButton-secondary"]:hover {
-    border-color: var(--aa-accent);
-    color: var(--aa-accent);
+    border-color:var(--aa-teal) !important; color:var(--aa-teal) !important;
 }
-
 .stButton > button[kind="primary"],
 [data-testid="stBaseButton-primary"] {
-    border: 1px solid var(--aa-accent);
-    background: var(--aa-accent);
-    color: var(--aa-accent-ink);
+    background:var(--aa-teal) !important; color:#06231F !important;
+    border:1px solid var(--aa-teal) !important;
 }
-
 .stButton > button[kind="primary"]:hover,
 [data-testid="stBaseButton-primary"]:hover {
-    border-color: #7CC8D5;
-    background: #7CC8D5;
-    color: var(--aa-accent-ink);
+    background:#7CE4D1 !important; border-color:#7CE4D1 !important;
+    color:#06231F !important;
+}
+.stButton > button:disabled { opacity:.42; }
+.stButton > button:focus-visible {
+    outline:2px solid var(--aa-teal); outline-offset:2px;
 }
 
-/* Expanders and trace ----------------------------------- */
+/* Quick-start prompts read as suggestion rows, not centred buttons */
+[class*="st-key-suggested_prompt_"] button { justify-content:flex-start; }
+[class*="st-key-suggested_prompt_"] button > div { width:100%; justify-content:flex-start; }
+[class*="st-key-suggested_prompt_"] button p {
+    text-align:left; font-weight:500; font-size:12.5px;
+}
+
+/* Approval card */
+[class*="st-key-approval_card"] {
+    background:var(--aa-surface-2) !important;
+    border:1px solid #31515B !important;
+    border-radius:12px !important;
+}
+.aa-quote-amount {
+    color:#F1FAF8; font-size:26px; font-weight:600;
+    letter-spacing:-.5px; margin:2px 0 2px;
+    font-variant-numeric:tabular-nums;
+}
+.aa-quote-item { color:var(--aa-text); font-size:13px; font-weight:600; }
+.aa-quote-meta { color:var(--aa-muted); font-size:11.5px; margin-bottom:6px; }
+
+/* Alerts */
+[data-testid="stAlertContainer"] {
+    border-radius:10px !important;
+    border:1px solid var(--aa-border-soft);
+}
+[data-testid="stAlertContainer"] p { font-size:12.5px; line-height:1.55; }
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentInfo"]) {
+    background:rgba(133,184,245,.08) !important; border-color:rgba(133,184,245,.28);
+}
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentWarning"]) {
+    background:rgba(233,185,104,.09) !important; border-color:rgba(233,185,104,.30);
+}
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentSuccess"]) {
+    background:rgba(101,214,162,.09) !important; border-color:rgba(101,214,162,.30);
+}
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentError"]) {
+    background:rgba(240,128,128,.09) !important; border-color:rgba(240,128,128,.30);
+}
+
+/* Code blocks (trace and conversation IDs) */
+[data-testid="stCode"] pre, [data-testid="stCode"] code { font-size:11.5px !important; }
+
+/* Trace */
 [data-testid="stExpander"] {
-    margin-bottom: 8px;
-    border: 1px solid var(--aa-border);
-    border-radius: 10px;
-    background: var(--aa-raised);
+    background:var(--aa-surface-2);
+    border:1px solid var(--aa-border-soft);
+    border-radius:10px;
 }
-
+[data-testid="stExpander"] details,
 [data-testid="stExpander"] summary {
-    font-size: 13px;
-    font-weight: 500;
+    background:transparent !important;
 }
-
+[data-testid="stExpander"] summary {
+    color:var(--aa-text); font-size:12.5px; font-weight:600;
+}
+.aa-event {
+    display:flex; justify-content:space-between; align-items:flex-start;
+    gap:12px; padding:10px 0; border-bottom:1px solid var(--aa-border-soft);
+}
+.aa-event-left { display:flex; align-items:flex-start; gap:10px; min-width:0; }
+.aa-event-name {
+    color:var(--aa-text); font-family:'IBM Plex Mono',monospace;
+    font-size:11.5px; overflow-wrap:anywhere;
+}
+.aa-event-status { color:var(--aa-muted); font-size:11px; margin-top:3px; }
+.aa-event-time {
+    color:var(--aa-muted); font-size:11px; white-space:nowrap;
+    font-variant-numeric:tabular-nums;
+}
 .aa-empty {
-    padding: 90px 16px 0;
-    text-align: center;
+    display:flex; flex-direction:column; align-items:center;
+    justify-content:center; text-align:center; padding:0 16px;
+}
+.aa-empty-icon { color:var(--aa-teal); margin-bottom:12px; opacity:.9; }
+.aa-empty-title { color:var(--aa-text); font-size:13px; font-weight:600; }
+.aa-empty-copy {
+    max-width:260px; margin:7px auto 0; color:var(--aa-muted);
+    font-size:11.5px; line-height:1.6;
 }
 
-.aa-empty-title {
-    color: var(--aa-text);
-    font-size: 14px;
-    font-weight: 600;
+/* Decision inspector */
+.aa-decision-card {
+    padding:15px; border-radius:12px;
+    border:1px solid #31515B;
+    background:linear-gradient(145deg,#142D35,#12212E);
+    margin:4px 0 12px;
+}
+.aa-decision-label {
+    color:#9BB9BC; font-size:10px; font-weight:600;
+    text-transform:uppercase; letter-spacing:.09em;
+}
+.aa-decision-amount {
+    color:#F1FAF8; font-size:27px; font-weight:600;
+    letter-spacing:-.5px; margin-top:5px;
+}
+.aa-decision-note { color:#9BB9BC; font-size:11px; margin-top:3px; }
+.aa-check {
+    display:flex; align-items:flex-start; gap:8px;
+    color:#DCE9E9; font-size:12px; margin:9px 0;
+}
+.aa-check-mark { color:var(--aa-teal); font-weight:700; }
+.aa-muted-box {
+    border:1px solid var(--aa-border-soft); border-radius:10px;
+    background:var(--aa-surface-2); padding:14px;
+}
+.aa-steps { margin-top:14px; }
+.aa-step {
+    display:flex; align-items:flex-start; gap:12px;
+    position:relative; padding-bottom:14px;
+}
+.aa-step:last-child { padding-bottom:0; }
+.aa-step:not(:last-child)::before {
+    content:""; position:absolute; left:9px; top:22px; bottom:2px;
+    width:1px; background:var(--aa-border);
+}
+.aa-step-marker {
+    width:19px; height:19px; flex:none; border-radius:50%;
+    border:1.5px solid var(--aa-border); background:var(--aa-surface-2);
+    color:var(--aa-subtle); font-size:10px; font-weight:700;
+    display:flex; align-items:center; justify-content:center;
+}
+.aa-step-title { color:var(--aa-text); font-size:12.5px; font-weight:600; line-height:19px; }
+.aa-step-copy { color:var(--aa-muted); font-size:11.5px; line-height:1.5; }
+.aa-foot { color:var(--aa-subtle); font-size:11px; line-height:1.6; margin-top:12px; }
+.aa-mono {
+    font-family:'IBM Plex Mono',monospace; overflow-wrap:anywhere;
 }
 
-.aa-empty-text {
-    max-width: 260px;
-    margin: 8px auto 0;
-    color: var(--aa-muted);
-    font-size: 12.5px;
-    line-height: 1.65;
+/* Sidebar */
+.aa-side-brand {
+    display:flex; align-items:center; gap:10px;
+    color:var(--aa-text); font-size:16px; font-weight:700;
 }
-
-.aa-tool {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 9px 0;
-    border-bottom: 1px solid var(--aa-border);
+.aa-side-kicker {
+    color:var(--aa-muted); font-size:10px; letter-spacing:.1em;
+    text-transform:uppercase; margin-top:3px;
 }
-
-.aa-tool-main {
-    display: flex;
-    align-items: flex-start;
-    gap: 10px;
-}
-
-.aa-tool-main .aa-dot {
-    margin-top: 6px;
-}
-
-.aa-tool-name {
-    color: var(--aa-text);
-    font-family: 'IBM Plex Mono', ui-monospace, monospace;
-    font-size: 12.5px;
-    overflow-wrap: anywhere;
-}
-
-.aa-tool-status {
-    margin-top: 2px;
-    color: var(--aa-muted);
-    font-size: 12px;
-}
-
-.aa-tool-time {
-    color: var(--aa-muted);
-    font-size: 12px;
-    white-space: nowrap;
-    font-variant-numeric: tabular-nums;
-}
-
-/* Sidebar ----------------------------------------------- */
 .aa-side-label {
-    margin: 18px 0 6px;
-    color: var(--aa-text);
-    font-size: 13px;
-    font-weight: 600;
+    color:var(--aa-muted); font-size:10px; font-weight:700;
+    letter-spacing:.1em; text-transform:uppercase;
+    margin:20px 0 7px;
 }
-
-[data-testid="stCaptionContainer"] {
-    color: var(--aa-muted);
+[data-testid="stProgressBarTrack"] {
+    background:#1B2B3B !important; border-radius:999px; height:6px;
 }
-
-@media (max-width: 900px) {
-    .aa-metrics {
-        grid-template-columns: repeat(2, 1fr);
-    }
-
-    .aa-metric:nth-child(3) {
-        border-left: none;
-    }
-
-    .aa-metric:nth-child(n + 3) {
-        border-top: 1px solid var(--aa-border);
-    }
+[data-testid="stProgressBarTrack"] > div {
+    background:var(--aa-teal) !important; border-radius:999px;
 }
+[data-testid="stToggle"] label { color:var(--aa-text) !important; }
 
-@media (max-width: 768px) {
-    .block-container {
-        padding-left: 1rem;
-        padding-right: 1rem;
-    }
+/* Responsive */
+@media (max-width: 1050px) {
+    .aa-metrics { grid-template-columns:repeat(2,minmax(0,1fr)); }
+}
+@media (max-width: 700px) {
+    .block-container { padding:3.4rem .8rem 2rem; }
+    .aa-page-title { font-size:19px; }
+    .aa-metrics { gap:7px; }
+    .aa-metric { padding:9px 11px; }
+    .aa-metric-value { font-size:20px; }
 }
 </style>
     """,
@@ -639,22 +589,19 @@ def number(value):
 
 def duration(value):
     seconds = number(value)
-
     if seconds < 1:
         return f"{seconds * 1000:.0f} ms"
-
     return f"{seconds:.2f} s"
 
 
 def status_tone(status):
     value = str(status).lower()
-
     if value in {"success", "succeeded", "completed", "ok", "done"}:
         return "ok"
-
     if value in {"error", "failed", "failure", "exception"}:
         return "err"
-
+    if value in {"pending", "waiting", "approval_required"}:
+        return "warn"
     return ""
 
 
@@ -667,22 +614,71 @@ def pill(label, tone=""):
     )
 
 
-def render_header(closed):
-    state_pill = pill("Closed", "warn") if closed else pill("Ready", "ok")
+def current_session_status():
+    if st.session_state.pending_operation is not None:
+        return "Retry required", "warn"
+    if st.session_state.pending_approval is not None:
+        return "Approval required", "warn"
+    if st.session_state.conversation_closed:
+        return "Closed", "info"
+    if st.session_state.turn_number >= MAX_CONVERSATION_TURNS:
+        return "Turn limit reached", "warn"
+    return "Ready", "ok"
 
+
+def bordered(key, **kwargs):
+    """Bordered container with a stable CSS hook (st-key-<key>).
+
+    Falls back to an unkeyed container on Streamlit builds that predate
+    container keys, so the app still runs (just without the panel styling).
+    """
+    try:
+        return st.container(border=True, key=key, **kwargs)
+    except TypeError:
+        return st.container(border=True, **kwargs)
+
+
+def section_label(text):
+    st.markdown(
+        f'<div class="aa-section-label">{esc(text)}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def inspector_status():
+    if st.session_state.pending_approval is not None:
+        return "Pending", "warn"
+    if st.session_state.pending_operation is not None:
+        return "Unconfirmed", "warn"
+    if st.session_state.conversation_closed:
+        return "Closed", "info"
+    return "Idle", ""
+
+
+def render_header():
+    label, tone = current_session_status()
     st.markdown(
         f"""
-<div class="aa-header">
-<div class="aa-brand">
-<div class="aa-logo">
-<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7.5 3v5.5c0 4.6-3.1 8.2-7.5 9.5-4.4-1.3-7.5-4.9-7.5-9.5V6L12 3z"/><path d="M8.8 12.2l2.2 2.2 4.2-4.4"/></svg>
-</div>
-<div>
-<div class="aa-title">Refund support workspace</div>
-<div class="aa-subtitle">Policy-controlled conversations with an inspectable execution trace.</div>
-</div>
-</div>
-<div class="aa-header-pills">{state_pill}{pill("Sandbox")}</div>
+<div class="aa-topbar">
+  <div class="aa-brand">
+    <div class="aa-mark">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none"
+           stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+           stroke-linejoin="round">
+        <path d="M12 3l7.5 3v5.5c0 4.6-3.1 8.2-7.5 9.5-4.4-1.3-7.5-4.9-7.5-9.5V6L12 3z"/>
+        <path d="M8.8 12.2l2.2 2.2 4.2-4.4"/>
+      </svg>
+    </div>
+    <div>
+      <div class="aa-brand-sub"><b>AgentAudit</b> · Refund operations · Observable AI</div>
+      <div class="aa-page-title">Operations workspace</div>
+      <div class="aa-page-subtitle">Review customer requests, policy decisions and agent execution.</div>
+    </div>
+  </div>
+  <div class="aa-header-right">
+    {pill("Sandbox", "info")}
+    {pill(label, tone)}
+  </div>
 </div>
         """,
         unsafe_allow_html=True,
@@ -690,27 +686,32 @@ def render_header(closed):
 
 
 def render_metrics(items):
-    cells = "".join(
-        f'<div class="aa-metric">'
-        f'<div class="aa-metric-label">{esc(label)}</div>'
-        f'<div class="aa-metric-value">{esc(value)}</div>'
-        f'<div class="aa-metric-note">{esc(note)}</div>'
-        f"</div>"
-        for label, value, note in items
-    )
-
+    """items: (label, value, note) or (label, value, note, tone)."""
+    cells = []
+    for item in items:
+        label, value, note = item[:3]
+        tone = item[3] if len(item) > 3 else ""
+        cells.append(
+            f'<div class="aa-metric">'
+            f'<div class="aa-metric-label">{esc(label)}</div>'
+            f'<div class="aa-metric-body">'
+            f'<span class="aa-metric-value {esc(tone)}">{esc(value)}</span>'
+            f'<span class="aa-metric-note">{esc(note)}</span>'
+            f"</div></div>"
+        )
     st.markdown(
-        f'<div class="aa-metrics">{cells}</div>',
+        f'<div class="aa-metrics">{"".join(cells)}</div>',
         unsafe_allow_html=True,
     )
 
 
-def panel_heading(title, badge_html):
+def panel_heading(title, badge_html, kicker=None):
+    kicker_html = f'<div class="aa-panel-kicker">{esc(kicker)}</div>' if kicker else ""
     st.markdown(
         f"""
 <div class="aa-panel-heading">
-<div class="aa-panel-title">{esc(title)}</div>
-{badge_html}
+  <div>{kicker_html}<div class="aa-panel-title">{esc(title)}</div></div>
+  {badge_html}
 </div>
         """,
         unsafe_allow_html=True,
@@ -720,20 +721,21 @@ def panel_heading(title, badge_html):
 def render_trace(record, expanded=False):
     turn = record.get("turn_number", "-")
     elapsed = duration(record.get("execution_time_seconds"))
+    status = record.get("status", "unknown")
+    events = record.get("tool_events") or []
+    count = record.get("tool_call_count", len(events))
 
-    with st.expander(f"Turn {turn}, {elapsed}", expanded=expanded):
+    with st.expander(
+        f"Turn {turn}  ·  {str(status).upper()}  ·  {elapsed}", expanded=expanded
+    ):
         if record.get("trace_unavailable"):
             st.warning(
                 "Detailed tracing was unavailable for this turn. "
                 "Processing time is retained locally."
             )
 
-        status = record.get("status", "unknown")
-        events = record.get("tool_events") or []
-        count = record.get("tool_call_count", len(events))
         noun = "tool call" if count == 1 else "tool calls"
-
-        st.caption(f"{str(status).capitalize()}, {count} {noun}")
+        st.caption(f"{count} {noun} recorded for this turn.")
 
         if not events and not record.get("trace_unavailable"):
             st.caption("No tool calls were made in this turn.")
@@ -748,49 +750,131 @@ def render_trace(record, expanded=False):
 
             st.markdown(
                 f"""
-<div class="aa-tool">
-<div class="aa-tool-main">
-<span class="aa-dot {dot_class}"></span>
-<div>
-<div class="aa-tool-name">{esc(sequence)}. {esc(name)}</div>
-<div class="aa-tool-status">{esc(event_status)}</div>
-</div>
-</div>
-<div class="aa-tool-time">{esc(event_time)}</div>
+<div class="aa-event">
+  <div class="aa-event-left">
+    <span class="aa-dot {dot_class}" style="margin-top:5px"></span>
+    <div>
+      <div class="aa-event-name">{esc(sequence)}. {esc(name)}</div>
+      <div class="aa-event-status">{esc(event_status)}</div>
+    </div>
+  </div>
+  <div class="aa-event-time">{esc(event_time)}</div>
 </div>
                 """,
                 unsafe_allow_html=True,
             )
 
             if st.session_state.show_tool_details:
-                st.caption("Arguments")
-                st.json(event.get("arguments", {}), expanded=False)
-
-                st.caption("Result")
-                st.json(event.get("result", {}), expanded=False)
-
-                if event.get("error"):
-                    st.caption("Tool error")
-                    st.json(event["error"], expanded=False)
+                with st.expander(f"Payload · {name}", expanded=False):
+                    st.caption("Arguments")
+                    st.json(event.get("arguments", {}), expanded=False)
+                    st.caption("Result")
+                    st.json(event.get("result", {}), expanded=False)
+                    if event.get("error"):
+                        st.caption("Tool error")
+                        st.json(event["error"], expanded=False)
 
         if record.get("error"):
             st.warning("This turn ended with an execution error.")
-
             if st.session_state.show_tool_details:
                 st.json(record["error"], expanded=False)
 
         st.caption("Trace reference")
-        st.code(
-            str(record.get("trace_id", "Unavailable")),
-            language=None,
+        st.code(str(record.get("trace_id", "Unavailable")), language=None)
+
+
+POLICY_STEPS = [
+    ("Customer verification", "Confirm who is making the request."),
+    ("Purchase matching", "Find the order and items in question."),
+    ("Eligibility check", "Apply the refund policy to each item."),
+    ("Refund quote", "Propose an amount for your explicit approval."),
+]
+
+
+def render_decision_inspector():
+    approval = st.session_state.pending_approval
+    operation = st.session_state.pending_operation
+
+    if isinstance(approval, dict):
+        quote = approval.get("quote") or {}
+        amount = quote.get("refund_amount", "Unavailable")
+        st.markdown(
+            f"""
+<div class="aa-decision-card">
+  <div class="aa-decision-label">Proposed refund amount</div>
+  <div class="aa-decision-amount">{esc(amount)}</div>
+  <div class="aa-decision-note">Quote awaiting your explicit confirmation</div>
+</div>
+            """,
+            unsafe_allow_html=True,
         )
+        st.caption(f"Customer · {approval.get('user', 'Unavailable')}")
+        section_label("Quoted items")
+        for item in quote.get("items", []):
+            st.markdown(
+                f'<div class="aa-check"><span class="aa-check-mark">•</span>'
+                f"<span>{esc(item.get('item', 'Unknown item'))} · "
+                f"{esc(item.get('price', 'Price unavailable'))} · "
+                f"Purchased {esc(item.get('purchase_date', 'date unavailable'))}</span></div>",
+                unsafe_allow_html=True,
+            )
+        st.info(
+            "No ticket has been issued yet. Confirming authorizes simulated "
+            "ticket creation; no money is transferred."
+        )
+        return
+
+    if operation is not None:
+        section_label("Request recovery")
+        st.warning(
+            "The previous operation has an unconfirmed outcome. Retry the "
+            "same request before submitting another message."
+        )
+        st.caption("Original request ID")
+        st.code(str(operation.get("refund_request_id", "Unavailable")), language=None)
+        st.caption(
+            "Retry retains this request ID to avoid creating a new logical request."
+        )
+        return
+
+    if st.session_state.conversation_closed:
+        section_label("Session outcome")
+        st.success("This conversation is closed.")
+        st.caption("Start a new conversation to submit another request.")
+        return
+
+    steps = "".join(
+        f'<div class="aa-step">'
+        f'<div class="aa-step-marker">{index}</div>'
+        f'<div><div class="aa-step-title">{esc(title)}</div>'
+        f'<div class="aa-step-copy">{esc(copy)}</div></div>'
+        f"</div>"
+        for index, (title, copy) in enumerate(POLICY_STEPS, start=1)
+    )
+    st.markdown(
+        f"""
+<div class="aa-muted-box">
+  <div class="aa-decision-label">Waiting for a request</div>
+  <div class="aa-steps">{steps}</div>
+  <div class="aa-foot">Evidence for each check appears here as the workflow produces it.</div>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # ---------------------------------------------------------
 # Session status
 # ---------------------------------------------------------
 
-turn_limit_reached = st.session_state.turn_number >= MAX_CONVERSATION_TURNS
+pending_operation = st.session_state.pending_operation
+pending_approval = st.session_state.pending_approval
+
+turn_limit_reached = (
+    st.session_state.turn_number >= MAX_CONVERSATION_TURNS
+    and pending_operation is None
+    and pending_approval is None
+)
 
 if turn_limit_reached:
     st.session_state.conversation_closed = True
@@ -803,30 +887,49 @@ closed = st.session_state.conversation_closed
 # ---------------------------------------------------------
 
 with st.sidebar:
-    st.markdown("### AgentAudit")
-    st.caption("Observable refund support")
+    st.markdown(
+        """
+<div class="aa-side-brand">
+  <span style="color:#55D6BE;font-size:20px">◈</span>
+  <div>
+    <div>AgentAudit</div>
+    <div class="aa-side-kicker">Refund support console</div>
+  </div>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     st.markdown('<div class="aa-side-label">Workspace</div>', unsafe_allow_html=True)
-
     st.button(
-        "New conversation",
+        "＋  New conversation",
         type="primary",
         use_container_width=True,
+        disabled=(
+            st.session_state.pending_operation is not None
+            or st.session_state.pending_approval is not None
+        ),
         on_click=start_new_conversation,
     )
 
-    st.markdown('<div class="aa-side-label">Session</div>', unsafe_allow_html=True)
+    st.caption(
+        "Cross-session conversation recovery is disabled until "
+        "authenticated ownership controls are implemented."
+    )
 
-    st.caption(f"{st.session_state.turn_number} of {MAX_CONVERSATION_TURNS} turns used")
-
+    st.markdown(
+        '<div class="aa-side-label">Session usage</div>', unsafe_allow_html=True
+    )
+    st.caption(f"{st.session_state.turn_number} of {MAX_CONVERSATION_TURNS} turns")
     st.progress(min(st.session_state.turn_number / MAX_CONVERSATION_TURNS, 1.0))
 
     with st.expander("Session details"):
         st.caption("Conversation ID")
         st.code(st.session_state.thread_id, language=None)
 
-    st.markdown('<div class="aa-side-label">Inspection</div>', unsafe_allow_html=True)
-
+    st.markdown(
+        '<div class="aa-side-label">Developer inspection</div>', unsafe_allow_html=True
+    )
     st.toggle(
         "Inspect tool payloads",
         key="show_tool_details",
@@ -837,9 +940,7 @@ with st.sidebar:
     )
 
     st.caption("Use synthetic customer data in public demos.")
-
     st.divider()
-
     st.caption(
         "Sandbox environment. Refund policy is enforced by deterministic tools. "
         "Ticket issuance is simulated and no bank transfer is performed."
@@ -850,48 +951,46 @@ with st.sidebar:
 # Header and metrics
 # ---------------------------------------------------------
 
-render_header(closed)
+render_header()
 
 traces = st.session_state.trace_records
-
 complete_traces = [record for record in traces if not record.get("trace_unavailable")]
 
 total_tools = sum(
     int(number(record.get("tool_call_count"))) for record in complete_traces
 )
-
 successful_tools = sum(
     int(number(record.get("successful_tool_count"))) for record in complete_traces
 )
-
 failed_tools = sum(
     int(number(record.get("failed_tool_count"))) for record in complete_traces
 )
-
 total_time = sum(number(record.get("execution_time_seconds")) for record in traces)
-
 has_missing_traces = any(record.get("trace_unavailable") for record in traces)
 
-tool_count_display = str(total_tools)
-
-success_display = f"{successful_tools / total_tools:.0%}" if total_tools else "-"
-
-tool_detail = f"{successful_tools} succeeded, {failed_tools} failed"
-
-if has_missing_traces:
-    tool_count_display = f"{total_tools}+"
-    tool_detail = "Partial tracing data"
+tool_count_display = f"{total_tools}+" if has_missing_traces else str(total_tools)
+success_display = f"{successful_tools / total_tools:.0%}" if total_tools else "—"
+tool_detail = (
+    "Partial tracing data"
+    if has_missing_traces
+    else f"{successful_tools} succeeded · {failed_tools} failed"
+)
 
 render_metrics(
     [
         (
             "Conversation turns",
-            f"{st.session_state.turn_number} / {MAX_CONVERSATION_TURNS}",
+            f"{st.session_state.turn_number}/{MAX_CONVERSATION_TURNS}",
             "Current session",
         ),
         ("Tool executions", tool_count_display, tool_detail),
-        ("Tool success rate", success_display, "Recorded executions only"),
-        ("Processing time", duration(total_time), "Cumulative execution"),
+        (
+            "Tool success rate",
+            success_display,
+            "Recorded executions only",
+            "" if not total_tools else ("warn" if failed_tools else "ok"),
+        ),
+        ("Processing time", duration(total_time), "Cumulative execution time"),
     ]
 )
 
@@ -903,31 +1002,48 @@ if st.session_state.trace_warning:
 
 
 # ---------------------------------------------------------
-# Workspace
+# Main workspace
 # ---------------------------------------------------------
 
-conversation_column, trace_column = st.columns([1.6, 1], gap="medium")
+conversation_column, inspector_column, trace_column = st.columns(
+    [1.25, 0.92, 1.05],
+    gap="medium",
+)
 
 user_input = None
+retry_clicked = False
+
+# Give the transcript less height while a retry or approval card needs room.
+action_pending = (
+    st.session_state.pending_operation is not None
+    or st.session_state.pending_approval is not None
+)
+chat_height = max(CHAT_BODY_HEIGHT - 110, 200) if action_pending else CHAT_BODY_HEIGHT
 
 with conversation_column:
-    with st.container(border=True):
+    with bordered("panel_conversation"):
         panel_heading(
-            "Conversation", pill("Closed", "warn") if closed else pill("Ready", "ok")
+            "Conversation",
+            pill("Closed", "info") if closed else pill("Live session", "ok"),
+            kicker="Customer interaction",
         )
 
-        with st.container(height=CHAT_BODY_HEIGHT, border=False):
+        with st.container(height=chat_height, border=False):
             for message in st.session_state.messages:
                 avatar = (
                     ASSISTANT_AVATAR if message["role"] == "assistant" else USER_AVATAR
                 )
-
                 with st.chat_message(message["role"], avatar=avatar):
+                    if message["role"] == "user":
+                        # Constant, invisible marker so CSS can tint user turns.
+                        st.markdown(
+                            '<div class="aa-user-marker"></div>',
+                            unsafe_allow_html=True,
+                        )
                     st.markdown(message["content"])
 
             if st.session_state.turn_number == 0 and not closed:
-                st.caption("Try one of these to get started")
-
+                section_label("Quick start")
                 for index, prompt in enumerate(SUGGESTED_PROMPTS):
                     st.button(
                         prompt,
@@ -937,14 +1053,77 @@ with conversation_column:
                         args=(prompt,),
                     )
 
+        if st.session_state.pending_operation is not None:
+            st.warning(
+                "The previous request has an unconfirmed outcome. "
+                "Retry it before submitting another request."
+            )
+            retry_clicked = st.button(
+                "Retry previous request",
+                key="retry_pending_operation",
+                type="primary",
+                use_container_width=True,
+            )
+
+        approval = st.session_state.pending_approval
+        if isinstance(approval, dict):
+            approval_quote = approval.get("quote") or {}
+            with bordered("approval_card"):
+                section_label("Review refund quote")
+                st.caption(f"Customer · {approval.get('user', 'Unavailable')}")
+                for item in approval_quote.get("items", []):
+                    st.markdown(
+                        f'<div class="aa-quote-item">{esc(item.get("item", "Unknown item"))}'
+                        f" · {esc(item.get('price', 'Price unavailable'))}</div>"
+                        f'<div class="aa-quote-meta">Purchased '
+                        f"{esc(item.get('purchase_date', 'date unavailable'))}</div>",
+                        unsafe_allow_html=True,
+                    )
+                st.markdown(
+                    '<div class="aa-quote-amount">'
+                    f"{esc(approval_quote.get('refund_amount', 'Amount unavailable'))}"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+                st.caption(
+                    "Simulated ticket only. No money is transferred. "
+                    "Confirming authorizes ticket creation."
+                )
+                confirm_col, decline_col = st.columns(2)
+                with confirm_col:
+                    st.button(
+                        "Confirm refund",
+                        key="confirm_pending_refund",
+                        type="primary",
+                        use_container_width=True,
+                        on_click=confirm_pending_approval,
+                    )
+                with decline_col:
+                    st.button(
+                        "Decline",
+                        key="decline_pending_refund",
+                        use_container_width=True,
+                        on_click=decline_pending_approval,
+                    )
+
         user_input = st.chat_input(
             "Describe your order issue",
             key="refund_message",
-            disabled=closed,
+            disabled=(
+                closed
+                or st.session_state.pending_operation is not None
+                or st.session_state.pending_approval is not None
+            ),
             max_chars=1000,
         )
 
-        if turn_limit_reached:
+        if st.session_state.pending_operation is not None:
+            st.caption("Retry reuses the original request ID and conversation turn.")
+        elif st.session_state.pending_approval is not None:
+            st.caption(
+                "Use the explicit approval controls. Chat messages cannot approve a quote."
+            )
+        elif turn_limit_reached:
             st.caption("Turn limit reached. Start a new conversation to continue.")
         elif closed:
             st.caption("This conversation is closed. Start a new one to continue.")
@@ -952,17 +1131,42 @@ with conversation_column:
             st.caption("Include your order number. Do not enter payment details.")
 
 
-with trace_column:
-    with st.container(border=True):
-        panel_heading("Execution trace", pill(f"{len(traces)} recorded"))
+with inspector_column:
+    with bordered("panel_inspector"):
+        inspector_label, inspector_tone = inspector_status()
+        panel_heading(
+            "Decision inspector",
+            pill(inspector_label, inspector_tone),
+            kicker="Policy and action",
+        )
+        with st.container(height=PANEL_BODY_HEIGHT, border=False):
+            render_decision_inspector()
 
-        with st.container(height=TRACE_BODY_HEIGHT, border=False):
+
+with trace_column:
+    with bordered("panel_trace"):
+        panel_heading(
+            "Execution trace",
+            pill(f"{len(traces)} recorded", "info"),
+            kicker="Agent observability",
+        )
+
+        with st.container(height=PANEL_BODY_HEIGHT, border=False):
             if not traces:
                 st.markdown(
-                    """
-<div class="aa-empty">
-<div class="aa-empty-title">No activity yet</div>
-<div class="aa-empty-text">Send a message to see each tool call with its order, timing and result.</div>
+                    f"""
+<div class="aa-empty" style="min-height:{PANEL_BODY_HEIGHT - 24}px">
+  <div class="aa-empty-icon">
+    <svg width="30" height="30" viewBox="0 0 24 24" fill="none"
+         stroke="currentColor" stroke-width="1.7" stroke-linecap="round"
+         stroke-linejoin="round">
+      <path d="M3 12h4l2.5-6 5 12 2.5-6H21"/>
+    </svg>
+  </div>
+  <div class="aa-empty-title">No execution activity yet</div>
+  <div class="aa-empty-copy">
+    Send a message to inspect tool calls, execution order, timing and results.
+  </div>
 </div>
                     """,
                     unsafe_allow_html=True,
@@ -972,20 +1176,30 @@ with trace_column:
                 render_trace(record, expanded=index == 0)
 
         st.caption(
-            "Turn on “Inspect tool payloads” in the sidebar for arguments and results. "
-            "Success means the tool ran, not that the policy decision was correct."
+            "Tool success means the tool executed successfully; it does not "
+            "establish that the policy decision was correct."
         )
 
 
 # ---------------------------------------------------------
-# Request processing
+# Request processing — preserved
 # ---------------------------------------------------------
 
 prompt = user_input or st.session_state.pending_prompt
 st.session_state.pending_prompt = None
 
-if prompt and prompt.strip() and not closed:
+if retry_clicked:
+    with st.spinner("Retrying the original request..."):
+        execute_pending_operation()
+    st.rerun()
+
+elif (
+    prompt
+    and prompt.strip()
+    and not closed
+    and st.session_state.pending_operation is None
+    and st.session_state.pending_approval is None
+):
     with st.spinner("Reviewing your request..."):
         process_message(prompt)
-
     st.rerun()

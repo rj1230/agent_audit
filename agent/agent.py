@@ -4,19 +4,18 @@ from uuid import uuid4
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
+from langchain.agents.structured_output import ToolStrategy
 from langchain.messages import HumanMessage
-from langgraph.checkpoint.memory import InMemorySaver
+from agent.checkpoint_store import checkpointer
 
-from models import model
-from tools import (
-    calculate_right_refund,
-    get_today_date,
-    get_user_purchase_history,
-    issue_refund_ticket,
-)
-from prompts import agent_system_prompt
-from objects import Answer
-from tracing import ToolTraceCallback, write_agent_trace
+from agent.models import model
+from agent.agent_context import AgentContext
+from agent.tools import get_user_purchase_history
+from agent.prompts import agent_system_prompt
+from agent.objects import Answer, PurchaseItem
+from agent.execution import _proposal_to_approval
+from agent.tools import issue_approved_refund_ticket
+from agent.tracing import ToolTraceCallback, write_agent_trace
 
 
 load_dotenv()
@@ -36,12 +35,10 @@ agent = create_agent(
     system_prompt=agent_system_prompt,
     tools=[
         get_user_purchase_history,
-        calculate_right_refund,
-        issue_refund_ticket,
-        get_today_date,
     ],
-    response_format=Answer,
-    checkpointer=InMemorySaver(),
+    response_format=ToolStrategy(Answer),
+    context_schema=AgentContext,
+    checkpointer=checkpointer,
 )
 
 
@@ -84,12 +81,17 @@ def run_conversation(initial_message=None):
         response = None
         error = None
 
+        refund_request_id = str(uuid4())
+
         try:
             response = agent.invoke(
                 {"messages": [HumanMessage(content=user_text)]},
                 config={
                     **config,
                     "callbacks": [tool_callback],
+                },
+                context={
+                    "refund_request_id": refund_request_id,
                 },
             )
 
@@ -125,8 +127,91 @@ def run_conversation(initial_message=None):
             )
             return
 
-        print("\nSupport Agent:")
-        print(structured_response.answer)
+        proposal = structured_response.refund_proposal
+
+        if proposal is None:
+            print("\nSupport Agent:")
+            print(structured_response.answer)
+
+        if proposal is not None:
+            try:
+                approval, validation_error = _proposal_to_approval(
+                    proposal,
+                    refund_request_id,
+                )
+
+                if validation_error:
+                    print(
+                        "\nI couldn't prepare a valid refund quote: "
+                        f"{validation_error}. No ticket was created."
+                    )
+                elif approval is not None:
+                    print("\nSupport Agent:")
+                    print(
+                        "The application has prepared a refund quote "
+                        "for your review. No ticket has been created."
+                    )
+                    quote = approval["quote"]
+
+                    print("\n========== REFUND QUOTE ==========")
+                    print(f"Customer: {quote['user']}")
+
+                    for item in quote["items"]:
+                        print(
+                            f"- {item['item']}: "
+                            f"{item['price']} "
+                            f"(purchased {item['purchase_date']})"
+                        )
+
+                    print(f"Total refund: {quote['refund_amount']}")
+                    print("Simulation only; no money will be transferred.")
+
+                    confirmation = input(
+                        "\nConfirm this exact refund quote? (y/N): "
+                    ).strip().lower()
+
+                    if confirmation == "y":
+                        ticket_result = issue_approved_refund_ticket(
+                            request_id=approval["request_id"],
+                            user=approval["user"],
+                            items=[
+                                PurchaseItem(name=item["name"])
+                                for item in approval["items"]
+                            ],
+                            approved_quote=quote,
+                        )
+
+                        if ticket_result.get("ticket_issued"):
+                            print(
+                                "\nSimulated refund ticket recorded: "
+                                f"{ticket_result['ticket_id']}"
+                            )
+                            if ticket_result.get("existing"):
+                                print(
+                                    "This is the previously recorded ticket "
+                                    "for the same request."
+                                )
+                            print("No money was transferred.")
+                        else:
+                            print(
+                                "\nNo ticket was created: "
+                                f"{ticket_result.get('reason', 'validation_failed')}"
+                            )
+                    else:
+                        print(
+                            "\nRefund quote declined. No ticket was created."
+                        )
+
+            except Exception:
+                logger.exception(
+                    "CLI approval processing failed. thread=%s turn=%s",
+                    thread_id,
+                    turn_number,
+                )
+                print(
+                    "\nI couldn't complete the approval step. "
+                    "No new ticket should be assumed."
+                )
 
         if not structured_response.conversation:
             print("\nConversation completed.")

@@ -1,166 +1,142 @@
-<div align="center">
+# AgentAudit
 
-# 🧾 AgentAudit
+AgentAudit is an agentic refund-support application built with **LangChain, LangGraph, Groq, SQLite, and Streamlit**.
 
-### Tool-Using Refund-Support Agent with Deterministic Business Logic
+It demonstrates how an LLM-powered support agent can coordinate tools while relying on deterministic Python logic for refund eligibility, amount calculations, and ticket issuance.
 
-**An LLM agent that coordinates tools while Python stays authoritative for refund eligibility and amounts, with full tool-level tracing and a seven-metric evaluation suite.**
+> **Important:** Refund ticket issuance is simulated. This project does not initiate real payments, bank transfers, or refunds.
 
-[![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python&logoColor=white)](https://www.python.org/)
-[![LangChain](https://img.shields.io/badge/LangChain-Agent-1C3C3C)](https://www.langchain.com/)
-[![LangGraph](https://img.shields.io/badge/LangGraph-Orchestration-1C3C3C)](https://github.com/langchain-ai/langgraph)
-[![Groq](https://img.shields.io/badge/Groq-Inference-F55036)](https://groq.com/)
-[![Streamlit](https://img.shields.io/badge/Streamlit-UI-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)
-[![DeepEval](https://img.shields.io/badge/DeepEval-Evaluation-6C47FF)](https://github.com/confident-ai/deepeval)
+## Features
 
-</div>
+- Conversational refund-support interface built with Streamlit.
+- LangChain agent orchestration backed by LangGraph.
+- Groq-hosted Qwen model integration.
+- Purchase-history lookup against a synthetic dataset of 1,000 users.
+- Deterministic refund validation using a 30-day eligibility window.
+- Decimal-based refund amount calculation.
+- Simulated refund-ticket issuance with SQLite persistence.
+- Request-ID-based idempotency to prevent duplicate tickets during retries.
+- Persistent LangGraph checkpoints using SQLite.
+- Interrupted-operation recovery for the active session using saved graph state.
+- Cross-session conversation restoration is disabled in the unauthenticated shared UI.
+- Tool execution tracing with JSONL records.
+- DeepEval-based agent evaluation.
 
----
-
-## 📌 Overview
-
-**AgentAudit** is an agentic refund-support application built with LangChain, LangGraph, Groq, and Streamlit.
-
-Instead of letting the model decide refund outcomes, AgentAudit splits responsibilities: the LLM handles conversation and tool coordination, while deterministic Python logic validates purchases, enforces the refund window, and calculates amounts.
-
-The project is built around one core principle:
-
-> **The LLM coordinates. Python decides.** Eligibility and money are never left to model judgment.
-
-> ⚠️ **Important:** Refund ticket issuance is simulated. This project does not initiate real payments, bank transfers, or refunds.
-
----
-
-## ✨ Key Capabilities
-
-### 🤖 Agentic Support Workflow
-
-- **Conversational refund interface** built with Streamlit.
-- **LangChain agent orchestration** backed by LangGraph.
-- **Groq-hosted Qwen model** for tool selection and response generation.
-- **Structured responses** validated with Pydantic.
-
-### 🧮 Deterministic Refund Logic
-
-- **Purchase-history lookup** against a synthetic dataset of 1,000 users.
-- **30-day eligibility window** enforced in Python, not in the prompt.
-- **Decimal-based amount calculation** to avoid floating-point money errors.
-- **Revalidation at ticket time:** the ticket tool re-checks eligibility before issuing a simulated result.
-
-### 🔍 Traceability
-
-- **Tool execution tracing** via custom callbacks.
-- **JSONL trace records** capturing tool calls, latency, and results.
-- **Inspectable agent behavior** for debugging and auditing.
-
-### 📈 Evaluation
-
-- **DeepEval-based agent evaluation** across seven metrics.
-- **Combined evaluation runner** for end-to-end scoring.
-- **Groq-hosted judge model** for metric scoring.
-
----
-
-## 🏗️ Architecture
+## Architecture
 
 ```mermaid
 flowchart TD
-    A[User] --> B[Streamlit Interface]
-    B --> C[LangChain / LangGraph Agent]
+    U[User] --> UI[Streamlit Interface]
+    UI --> A[LangChain Agent / LangGraph]
 
-    subgraph Tools["Deterministic Tool Layer"]
-    D[Current Date Tool]
-    E[Purchase History Tool]
-    F[Refund Eligibility and Amount Tool]
-    G[Simulated Refund Ticket Tool]
-    end
+    A --> PH[Purchase History Tool]
+    A --> RV[Refund Validation Tool]
+    A --> CD[Current Date Tool]
+    A --> IT[Simulated Ticket Tool]
 
-    C --> D
-    C --> E
-    C --> F
-    C --> G
+    PH --> DATA[(Synthetic Purchase Dataset)]
+    RV --> RULES[Deterministic Refund Rules]
+    IT --> IDEM[Existing Ticket / Idempotency Check]
+    IDEM --> TS[(SQLite Ticket Store)]
 
-    F -->|Validated result| C
-    G -->|Revalidates before issuing| F
+    A <--> CP[(SQLite Checkpoint Store)]
+    A --> TR[Tool Execution Tracing]
+    TR --> JL[JSONL Trace Records]
 
-    C --> H[Structured Response]
-    H --> A
+    A --> SR[Structured Response]
+    SR --> UI
+    UI --> U
 
-    Tools -.-> T[(JSONL Traces)]
+    CP -. Resume interrupted operation .-> A
+    TS -. Recover existing ticket .-> IT
 ```
 
-### Request Flow
+### Request and recovery lifecycle
 
-1. **User** describes a refund request in the Streamlit chat.
-2. **Agent** resolves the current date and looks up the customer's purchase history.
-3. **Eligibility tool** validates each requested item and calculates the refund amount with `Decimal` arithmetic.
-4. **Ticket tool** revalidates eligibility, then returns a simulated refund ticket.
-5. **Tracing callbacks** write each tool execution to a JSONL record.
-6. **Agent** returns a structured response to the user.
+1. The user submits a refund-support request through Streamlit.
+2. The application invokes the LangGraph agent with a unique operation request ID.
+3. The agent coordinates the available tools.
+4. The ticket tool first checks whether the operation's request ID already has an issued ticket.
+5. If a matching ticket exists, the original result is returned without revalidating current eligibility. This allows safe recovery after the original refund window expires.
+6. If no ticket exists, deterministic Python validation checks purchase ownership, purchase dates, eligibility, and refund amounts.
+7. If the new request is eligible, a simulated ticket is persisted transactionally in SQLite, with a second idempotency check in the write path.
+8. LangGraph checkpoints preserve execution state so the active session can resume an interrupted operation through its retry flow.
+9. On retry, the original request ID is reused so the existing-ticket lookup prevents duplicate ticket issuance.
+10. The agent returns a structured response to the user.
 
----
+The LLM handles conversation and tool coordination. Deterministic Python logic remains authoritative for refund eligibility and amount calculations.
 
-## 📏 Refund Rules
+The ticket database and checkpoint database have separate responsibilities:
 
-The refund validator is the source of truth for every outcome. It:
+- **Ticket store:** Persists simulated refund tickets and enforces request-level idempotency.
+- **Checkpoint store:** Persists LangGraph execution state for interrupted-operation recovery.
 
-- Requires a valid customer username.
-- Requires at least one requested item.
-- Rejects duplicate item requests.
-- Checks that each requested item belongs to the customer.
-- Rejects future-dated purchases.
-- Enforces a 30-day refund window.
-- Calculates the eligible amount using Python `Decimal` arithmetic.
-- **Rejects the entire request if any requested item fails validation.**
+## Technology Stack
 
----
-
-## 🧩 Tech Stack
-
-| Layer | Tools |
+| Component | Technology |
 |---|---|
 | Language | Python |
-| Agent orchestration | LangChain, LangGraph |
+| Agent orchestration | LangChain / LangGraph |
 | Model provider | Groq |
 | Configured model | `qwen/qwen3.8-27b` |
 | User interface | Streamlit |
 | Structured validation | Pydantic |
+| Persistence | SQLite |
+| Checkpointing | LangGraph SQLite checkpointer |
 | Evaluation | DeepEval |
-| Tracing | Custom tool callbacks, JSONL records |
+| Tracing | Custom tool callbacks and JSONL records |
+| Testing | pytest |
 
----
-
-## 📂 Project Structure
+## Project Structure
 
 ```text
 AgentAudit/
 ├── agent/
 │   ├── .streamlit/
-│   │   └── config.toml       # Streamlit theme and settings
-│   ├── agent.py              # LangChain / LangGraph agent setup
-│   ├── data.py               # Dataset loading and lookups
-│   ├── models.py             # Pydantic schemas
-│   ├── objects.py            # Shared objects
-│   ├── prompts.py            # System prompt and instructions
-│   ├── tools.py              # Agent tools and refund logic
-│   ├── tracing.py            # Tool callbacks and JSONL trace writer
-│   ├── ui.py                 # Streamlit entrypoint
-│   └── users_data_1000.json  # Synthetic customer and purchase data
+│   │   └── config.toml
+│   ├── __init__.py
+│   ├── agent.py
+│   ├── agent_context.py
+│   ├── checkpoint_store.py
+│   ├── conversation_recovery.py
+│   ├── data.py
+│   ├── models.py
+│   ├── objects.py
+│   ├── prompts.py
+│   ├── retry.py
+│   ├── ticket_store.py
+│   ├── tools.py
+│   ├── tracing.py
+│   ├── ui.py
+│   └── users_data_1000.json
 ├── eval/
-│   ├── dataset.py            # Evaluation test cases
-│   ├── eval_all.py           # Combined seven-metric runner
-│   ├── model.py              # Groq-hosted judge model wrapper
-│   └── ...                   # Individual metric scripts
-├── understanding_metrics/    # Notes and experiments on each metric
+│   ├── agent_integration_benchmark.py
+│   ├── benchmark_reporting.py
+│   ├── dataset.py
+│   ├── deterministic_benchmark.py
+│   ├── eval_all.py
+│   ├── evaluation_helpers.py
+│   ├── EVALUATION_REPORT.md
+│   ├── model.py
+│   ├── results/
+│   └── individual metric scripts
+├── tests/
+│   ├── test_agent_checkpoint_integration.py
+│   ├── test_benchmark_reporting.py
+│   ├── test_conversation_recovery.py
+│   ├── test_evaluation_helpers.py
+│   ├── test_issue_refund_ticket.py
+│   ├── test_refund_rules.py
+│   ├── test_retry_resume.py
+│   └── test_ticket_store.py
+├── understanding_metrics/
 ├── requirements.txt
 └── .gitignore
 ```
 
----
+## Getting Started
 
-## 🚀 Quick Start
-
-### 1. Clone and enter the project
+### 1. Clone the repository
 
 ```bash
 git clone https://github.com/rj1230/agent_audit.git
@@ -173,16 +149,10 @@ cd agent_audit
 python -m venv .venv
 ```
 
-Activate it:
+Activate it on Windows PowerShell:
 
 ```powershell
-# Windows PowerShell
 .\.venv\Scripts\Activate.ps1
-```
-
-```bash
-# macOS / Linux
-source .venv/bin/activate
 ```
 
 ### 3. Install dependencies
@@ -191,13 +161,13 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-Or with `uv`:
+Alternatively, use `uv`:
 
 ```bash
 uv pip install -r requirements.txt
 ```
 
-### 4. Configure environment variables
+### 4. Configure the API key
 
 Create a `.env` file in the project root:
 
@@ -205,9 +175,9 @@ Create a `.env` file in the project root:
 GROQ_API_KEY=your_groq_api_key
 ```
 
-> Never commit `.env` or expose API credentials.
+Do not commit `.env` or expose API credentials.
 
-### 5. Launch the Streamlit UI
+### 5. Run the application
 
 From the project root:
 
@@ -215,35 +185,84 @@ From the project root:
 streamlit run agent/ui.py
 ```
 
-Open the local URL shown in the terminal.
+Open the local Streamlit URL displayed in the terminal.
 
-### 6. Run the evaluation suite
+## Evaluation
+
+Run the combined evaluation suite:
 
 ```bash
 python -m eval.eval_all
 ```
 
----
+The evaluation framework uses seven metrics:
 
-## 🧪 Evaluation
+1. Task Completion
+2. Step Efficiency
+3. Plan Quality
+4. Plan Adherence
+5. Argument Correctness
+6. Tool Correctness
+7. Answer Correctness
 
-AgentAudit evaluates complete agent executions across seven DeepEval metrics:
+The evaluation uses a Groq-hosted judge model. Evaluation consumes additional API tokens and may be affected by provider rate limits.
 
-| # | Metric | What it checks |
-|---|---|---|
-| 1 | **Task Completion** | Whether the agent accomplished the user's refund request |
-| 2 | **Step Efficiency** | Whether the agent reached the outcome without redundant steps |
-| 3 | **Plan Quality** | Whether the agent's plan was logical and complete |
-| 4 | **Plan Adherence** | Whether the agent followed its own plan |
-| 5 | **Argument Correctness** | Whether tool calls were made with correct arguments |
-| 6 | **Tool Correctness** | Whether the right tools were called |
-| 7 | **Answer Correctness** | Whether the final answer matches the expected outcome |
+## Tests
 
-> Evaluation uses a Groq-hosted judge model, consumes additional API tokens, and may be affected by provider rate limits. Scores depend on the configured judge model.
+Run the automated test suite:
 
----
+```bash
+python -m pytest -q
+```
 
-## 📡 Tracing
+The tests cover:
+
+- Deterministic refund eligibility rules.
+- Refund amount calculations.
+- Ticket issuance and SQLite persistence.
+- Idempotency and duplicate-ticket prevention.
+- Retry request-ID validation.
+- LangGraph checkpoint recovery.
+- Conversation recovery module validation (the restore UI is disabled in shared deployments).
+- Recovery after interruption following ticket persistence.
+
+## Refund Rules
+
+The deterministic refund validator:
+
+- Requires a valid customer username.
+- Requires at least one requested item.
+- Rejects duplicate item requests.
+- Checks that each requested item belongs to the customer.
+- Rejects future-dated purchases.
+- Enforces a 30-day refund window.
+- Calculates eligible refund amounts using Python `Decimal` arithmetic.
+- Rejects the request if any requested item fails validation.
+
+For a new operation, the ticket tool validates eligibility before issuing a simulated ticket. For a retry, it first checks for an existing ticket and returns the original result when the request ID and identifying request details match.
+
+## Persistence and Recovery
+
+AgentAudit uses SQLite for two independent persistence workflows.
+
+**Refund ticket persistence**
+
+- Stores issued simulated refund tickets.
+- Uses a unique request ID to identify an operation.
+- Checks for an existing ticket before revalidating a retry.
+- Uses a transactional write path to prevent duplicate ticket creation.
+- Rejects reuse of an idempotency key with a conflicting payload.
+
+**Conversation checkpoint persistence**
+
+- Stores LangGraph execution checkpoints in SQLite.
+- Preserves the original request ID across retries.
+- Supports resuming interrupted graph execution through the active session's retry flow.
+- The unauthenticated shared UI does not expose cross-session conversation listing or restoration; both remain disabled until authenticated ownership checks are implemented.
+
+The recovery design is intended to prevent duplicate simulated ticket issuance when execution is interrupted after the ticket has already been persisted.
+
+## Tracing
 
 Tool execution traces are written as JSONL records under:
 
@@ -251,37 +270,34 @@ Tool execution traces are written as JSONL records under:
 agent/traces/
 ```
 
-Each record supports inspection of tool execution, latency, results, and overall agent behavior.
+These records support inspection of:
 
-> 🔒 Trace files may contain customer and conversation data. Treat them as sensitive runtime data and do not commit them.
+- Tool execution arguments and results.
+- Execution status.
+- Tool latency.
+- Agent behavior across operations.
 
----
+Trace files may contain customer and conversation data. Treat them as sensitive runtime data and do not commit them.
 
-## 🛡️ Design Model
+## Limitations and Security Considerations
 
-AgentAudit separates concerns so that the riskiest decisions never rest on the LLM:
-
-- **Deterministic eligibility:** Window, ownership, and duplicate checks live in Python.
-- **Decimal arithmetic:** Refund amounts avoid floating-point drift.
-- **All-or-nothing validation:** One invalid item rejects the whole request.
-- **Revalidation at issuance:** The ticket tool never trusts earlier tool output.
-- **Simulated side effects:** No real payment system is connected.
-- **Traceable execution:** Every tool call is logged for later review.
-
----
-
-## ⚠️ Limitations
-
-- Refund tickets are simulated and not connected to a payment provider.
+- Refund tickets are simulated and are not connected to a payment provider.
 - Customer and purchase records are synthetic demonstration data.
-- No production customer authentication is implemented.
-- The in-memory conversation checkpointer does not provide durable persistence.
-- Evaluation results depend on the judge model and provider availability.
+- Production customer authentication and authorization are not implemented.
+- SQLite persistence does not provide a complete multi-process deployment or distributed coordination solution.
+- Recovery depends on the checkpoint database and original operation request ID being available.
+- Trace and checkpoint data require appropriate access controls and retention policies before production use.
+- Evaluation results depend on the configured judge model and provider availability.
 
----
+## Project Purpose
 
-## 🎯 Project Purpose
+AgentAudit explores the engineering of tool-using support agents, with emphasis on:
 
-AgentAudit explores the engineering of tool-using support agents, with emphasis on deterministic business rules, structured responses, tool execution, traceability, and evaluation.
+- Deterministic business-rule enforcement.
+- Structured agent responses.
+- Tool orchestration and execution tracing.
+- Persistent execution state.
+- Idempotent operations and retry recovery.
+- Automated agent evaluation.
 
 It is a demonstration project, not a production refund-processing system.

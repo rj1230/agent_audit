@@ -8,7 +8,8 @@ from decimal import Decimal, ROUND_HALF_UP
 from langchain.tools import tool
 from dotenv import load_dotenv
 
-from objects import PurchaseItem
+from agent.ticket_store import create_or_get_ticket
+from agent.objects import PurchaseItem
 
 load_dotenv()
 
@@ -122,7 +123,13 @@ def validate_refund(user: str, items: list[PurchaseItem]):
 
 @tool
 def get_user_purchase_history(user: str) -> dict:
-    """Retrieve purchase history for a customer username."""
+    """Verify a customer username and retrieve their purchase history.
+
+    A result of {"status": "invalid_username"} means verification failed.
+    This is a terminal result for the current request: stop refund processing
+    and do not issue a refund ticket. Ask the customer to provide a valid
+    username.
+    """
 
     logging.info("Retrieving purchase history for %s", user)
 
@@ -132,32 +139,34 @@ def get_user_purchase_history(user: str) -> dict:
     return users_data[user]
 
 
-@tool
-def calculate_right_refund(
+def issue_approved_refund_ticket(
+    *,
+    request_id: str,
     user: str,
     items: list[PurchaseItem],
+    approved_quote: dict,
 ) -> dict:
-    """Validate requested purchases and calculate the eligible refund amount."""
+    """Issue a simulated ticket after explicit application-side approval."""
 
-    logging.info("Calculating refund for %s", user)
+    if not isinstance(request_id, str) or not request_id.strip():
+        return {
+            "ticket_issued": False,
+            "reason": "missing_request_id",
+        }
 
-    result = validate_refund(user, items)
+    if not isinstance(approved_quote, dict):
+        return {
+            "ticket_issued": False,
+            "reason": "approved_quote_mismatch",
+        }
 
-    logging.info("Refund calculation result: %s", result)
+    if set(approved_quote) != {"user", "items", "refund_amount"}:
+        return {
+            "ticket_issued": False,
+            "reason": "approved_quote_mismatch",
+        }
 
-    return result
-
-
-@tool
-def issue_refund_ticket(
-    user: str,
-    items: list[PurchaseItem],
-) -> dict:
-    """Revalidate eligibility and issue a simulated refund ticket."""
-
-    logging.info("Processing refund ticket for %s", user)
-
-    # Never trust a refund amount supplied by the LLM.
+    # Revalidate against the authoritative dataset and current policy.
     result = validate_refund(user, items)
 
     if not result["eligible"]:
@@ -166,20 +175,48 @@ def issue_refund_ticket(
             "reason": result["reason"],
         }
 
-    # Simulated ticket creation for this portfolio project.
-    # A real implementation would persist the ticket or call a
-    # refund-service API here.
-    return {
-        "ticket_issued": True,
-        "user": user,
-        "items": result["items"],
+    current_items = sorted(
+        result["items"],
+        key=lambda item: item["item"],
+    )
+
+    try:
+        approved_items = approved_quote["items"]
+        if not isinstance(approved_items, list):
+            raise TypeError("Approved items must be a list.")
+
+        approved_items = sorted(
+            approved_items,
+            key=lambda item: item["item"],
+        )
+    except (TypeError, KeyError, AttributeError):
+        return {
+            "ticket_issued": False,
+            "reason": "approved_quote_mismatch",
+        }
+
+    current_quote = {
+        "user": result["user"],
+        "items": current_items,
         "refund_amount": result["refund_amount"],
-        "status": "success",
     }
 
+    supplied_quote = {
+        "user": approved_quote.get("user"),
+        "items": approved_items,
+        "refund_amount": approved_quote.get("refund_amount"),
+    }
 
-@tool
-def get_today_date() -> str:
-    """Return today's date in YYYY-MM-DD format."""
+    if supplied_quote != current_quote:
+        return {
+            "ticket_issued": False,
+            "reason": "approved_quote_mismatch",
+        }
 
-    return date.today().isoformat()
+    # The ticket store performs the final atomic idempotency check.
+    return create_or_get_ticket(
+        request_id=request_id,
+        user=result["user"],
+        items=current_items,
+        refund_amount=result["refund_amount"],
+    )
