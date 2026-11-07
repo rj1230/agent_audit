@@ -29,9 +29,17 @@ def build_agent_input(
     *,
     is_retry: bool,
     user_text: str,
-    request_id: str | None = None,
+    request_id: str,
 ):
     """Build first-attempt input or safely recover a failed operation."""
+    if not isinstance(request_id, str) or not request_id.strip():
+        raise RuntimeError(
+            "Every agent operation requires a non-empty request ID."
+        )
+
+    if not isinstance(user_text, str) or not user_text.strip():
+        raise RuntimeError("The original user message must not be empty.")
+
     if not is_retry:
         message = HumanMessage(content=user_text, id=request_id)
         return {"messages": [message]}
@@ -45,21 +53,20 @@ def build_agent_input(
         )
 
     values = snapshot.values or {}
+    messages = values.get("messages", [])
 
-    if request_id is not None:
-        messages = values.get("messages", [])
-        matching_request = any(
-            isinstance(message, HumanMessage)
-            and message.id == request_id
-            and message.content == user_text
-            for message in messages
+    matching_request = any(
+        isinstance(message, HumanMessage)
+        and message.id == request_id
+        and message.content == user_text
+        for message in messages
+    )
+
+    if not matching_request:
+        raise RuntimeError(
+            "Checkpoint does not match the pending request. "
+            "Refusing to resume or recover a different operation."
         )
-
-        if not matching_request:
-            raise RuntimeError(
-                "Checkpoint does not match the pending request. "
-                "Refusing to resume or recover a different operation."
-            )
 
     if snapshot.next:
         return None

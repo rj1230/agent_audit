@@ -5,13 +5,11 @@ from pathlib import Path
 from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 
-from langchain.tools import ToolRuntime, tool
+from langchain.tools import tool
 from dotenv import load_dotenv
 
-from agent_context import AgentContext
-from ticket_store import create_or_get_ticket, get_existing_ticket
-
-from objects import PurchaseItem
+from agent.ticket_store import create_or_get_ticket
+from agent.objects import PurchaseItem
 
 load_dotenv()
 
@@ -125,7 +123,13 @@ def validate_refund(user: str, items: list[PurchaseItem]):
 
 @tool
 def get_user_purchase_history(user: str) -> dict:
-    """Retrieve purchase history for a customer username."""
+    """Verify a customer username and retrieve their purchase history.
+
+    A result of {"status": "invalid_username"} means verification failed.
+    This is a terminal result for the current request: stop refund processing
+    and do not issue a refund ticket. Ask the customer to provide a valid
+    username.
+    """
 
     logging.info("Retrieving purchase history for %s", user)
 
@@ -135,58 +139,34 @@ def get_user_purchase_history(user: str) -> dict:
     return users_data[user]
 
 
-@tool
-def calculate_right_refund(
+def issue_approved_refund_ticket(
+    *,
+    request_id: str,
     user: str,
     items: list[PurchaseItem],
+    approved_quote: dict,
 ) -> dict:
-    """Validate requested purchases and calculate the eligible refund amount."""
-
-    logging.info("Calculating refund for %s", user)
-
-    result = validate_refund(user, items)
-
-    logging.info("Refund calculation result: %s", result)
-
-    return result
-
-
-@tool
-def issue_refund_ticket(
-    user: str,
-    items: list[PurchaseItem],
-    runtime: ToolRuntime[AgentContext],
-) -> dict:
-    """Revalidate eligibility and issue an idempotent simulated refund ticket."""
-
-    logging.info("Processing refund ticket for %s", user)
-
-    context = runtime.context
-    request_id = (
-        context.get("refund_request_id")
-        if isinstance(context, dict)
-        else None
-    )
+    """Issue a simulated ticket after explicit application-side approval."""
 
     if not isinstance(request_id, str) or not request_id.strip():
-        logging.error("Refund ticket rejected: missing request context.")
         return {
             "ticket_issued": False,
             "reason": "missing_request_id",
         }
 
-    # Recover an already-issued ticket before checking today's eligibility.
-    # This allows a legitimate retry after the original refund window expires.
-    existing = get_existing_ticket(
-        request_id=request_id,
-        user=user,
-        item_names=[item.name for item in items],
-    )
+    if not isinstance(approved_quote, dict):
+        return {
+            "ticket_issued": False,
+            "reason": "approved_quote_mismatch",
+        }
 
-    if existing is not None:
-        return existing
+    if set(approved_quote) != {"user", "items", "refund_amount"}:
+        return {
+            "ticket_issued": False,
+            "reason": "approved_quote_mismatch",
+        }
 
-    # New tickets must always pass current deterministic eligibility checks.
+    # Revalidate against the authoritative dataset and current policy.
     result = validate_refund(user, items)
 
     if not result["eligible"]:
@@ -195,18 +175,48 @@ def issue_refund_ticket(
             "reason": result["reason"],
         }
 
-    # The store performs a second idempotency check inside its write
-    # transaction, protecting against concurrent requests.
-    return create_or_get_ticket(
-        request_id=request_id,
-        user=user,
-        items=result["items"],
-        refund_amount=result["refund_amount"],
+    current_items = sorted(
+        result["items"],
+        key=lambda item: item["item"],
     )
 
+    try:
+        approved_items = approved_quote["items"]
+        if not isinstance(approved_items, list):
+            raise TypeError("Approved items must be a list.")
 
-@tool
-def get_today_date() -> str:
-    """Return today's date in YYYY-MM-DD format."""
+        approved_items = sorted(
+            approved_items,
+            key=lambda item: item["item"],
+        )
+    except (TypeError, KeyError, AttributeError):
+        return {
+            "ticket_issued": False,
+            "reason": "approved_quote_mismatch",
+        }
 
-    return date.today().isoformat()
+    current_quote = {
+        "user": result["user"],
+        "items": current_items,
+        "refund_amount": result["refund_amount"],
+    }
+
+    supplied_quote = {
+        "user": approved_quote.get("user"),
+        "items": approved_items,
+        "refund_amount": approved_quote.get("refund_amount"),
+    }
+
+    if supplied_quote != current_quote:
+        return {
+            "ticket_issued": False,
+            "reason": "approved_quote_mismatch",
+        }
+
+    # The ticket store performs the final atomic idempotency check.
+    return create_or_get_ticket(
+        request_id=request_id,
+        user=result["user"],
+        items=current_items,
+        refund_amount=result["refund_amount"],
+    )

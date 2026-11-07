@@ -1,14 +1,16 @@
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from contextlib import closing
+import json
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent"))
-
-from ticket_store import create_or_get_ticket, get_existing_ticket
+from agent.ticket_store import create_or_get_ticket, get_existing_ticket
 
 
 class TicketStoreTests(unittest.TestCase):
@@ -254,6 +256,161 @@ class TicketStoreTests(unittest.TestCase):
             result["reason"],
             "idempotency_key_payload_conflict",
         )
+
+
+    def test_concurrent_retries_create_only_one_ticket(self):
+        barrier = Barrier(2)
+
+        def issue_same_request():
+            barrier.wait(timeout=5)
+            return create_or_get_ticket(
+                "request-concurrent",
+                "user123",
+                self.items,
+                "30.00",
+                self.db_path,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(
+                lambda _: issue_same_request(),
+                range(2),
+            ))
+
+        self.assertTrue(all(result["ticket_issued"] for result in results))
+        self.assertEqual(
+            results[0]["ticket_id"],
+            results[1]["ticket_id"],
+        )
+        self.assertCountEqual(
+            [False, True],
+            [result["existing"] for result in results],
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM refund_tickets "
+                "WHERE request_id = ?",
+                ("request-concurrent",),
+            ).fetchone()[0]
+
+        self.assertEqual(count, 1)
+
+
+    def test_concurrent_conflicting_payloads_allow_only_one(self):
+        barrier = Barrier(2)
+
+        def issue(payload_items, amount):
+            barrier.wait(timeout=5)
+            return create_or_get_ticket(
+                "request-concurrent-conflict",
+                "user123",
+                payload_items,
+                amount,
+                self.db_path,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(issue, self.items, "30.00"),
+                executor.submit(
+                    issue,
+                    [{"item": "notebook", "price": "45.00",
+                      "purchase_date": "2026-10-04"}],
+                    "45.00",
+                ),
+            ]
+            results = [future.result() for future in futures]
+
+        self.assertCountEqual(
+            [True, False],
+            [result["ticket_issued"] for result in results],
+        )
+
+        conflict = next(
+            result for result in results if not result["ticket_issued"]
+        )
+        self.assertEqual(
+            conflict["reason"],
+            "idempotency_key_payload_conflict",
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            rows = connection.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT request_id) "
+                "FROM refund_tickets "
+                "WHERE request_id = ?",
+                ("request-concurrent-conflict",),
+            ).fetchone()
+
+        self.assertEqual(rows, (1, 1))
+
+
+    def test_ticket_recovers_after_separate_process_restart(self):
+        created = create_or_get_ticket(
+            "request-process-restart",
+            "user123",
+            self.items,
+            "30.00",
+            self.db_path,
+        )
+
+        script = """
+import json
+import sys
+from agent.ticket_store import create_or_get_ticket
+
+db_path = sys.argv[1]
+result = create_or_get_ticket(
+    "request-process-restart",
+    "user123",
+    [
+        {"item": "book", "price": "23.00",
+         "purchase_date": "2026-10-01"},
+        {"item": "pen", "price": "7.00",
+         "purchase_date": "2026-10-03"},
+    ],
+    "30.00",
+    db_path,
+)
+print(json.dumps(result))
+"""
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(self.db_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+            cwd=str(Path(__file__).resolve().parents[1]),
+        )
+
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"Child process failed: {completed.stderr}",
+        )
+
+        recovered = json.loads(completed.stdout.strip().splitlines()[-1])
+
+        self.assertTrue(recovered["ticket_issued"])
+        self.assertTrue(recovered["existing"])
+        self.assertEqual(recovered["ticket_id"], created["ticket_id"])
+        self.assertEqual(recovered["refund_amount"], "30.00")
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM refund_tickets "
+                "WHERE request_id = ?",
+                ("request-process-restart",),
+            ).fetchone()[0]
+
+        self.assertEqual(count, 1)
 
 
 if __name__ == "__main__":

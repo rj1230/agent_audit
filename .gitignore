@@ -26,3 +26,16 @@ agent/traces/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local safety backups
+*.bak
+
+# SQLite runtime sidecars
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Timestamped Python source backups
+*.before-*.py
+
+# Local benchmark run artifacts
+/eval/results/

@@ -4,10 +4,9 @@ from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent"))
 
-import tools
-from objects import PurchaseItem
+import agent.tools as tools
+from agent.objects import PurchaseItem
 
 
 class FrozenDate(date):

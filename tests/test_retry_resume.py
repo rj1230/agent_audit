@@ -7,10 +7,11 @@ from langgraph.graph import END, START, StateGraph
 import sys
 from pathlib import Path
 
-AGENT_DIR = Path(__file__).resolve().parents[1] / "agent"
-sys.path.insert(0, str(AGENT_DIR))
 
-from retry import build_agent_input
+from agent.retry import build_agent_input
+
+
+REQUEST_ID = "retry-request-test"
 
 
 class State(TypedDict):
@@ -84,6 +85,7 @@ def test_retry_rejects_missing_checkpoint():
             {"configurable": {"thread_id": "missing-checkpoint"}},
             is_retry=True,
             user_text="Check my refund",
+        request_id=REQUEST_ID,
         )
 
 
@@ -97,10 +99,12 @@ def test_first_attempt_submits_original_message():
         {},
         is_retry=False,
         user_text="Check my refund",
+    request_id=REQUEST_ID,
     )
 
     assert len(graph_input["messages"]) == 1
     assert graph_input["messages"][0].content == "Check my refund"
+    assert graph_input["messages"][0].id == REQUEST_ID
 
 
 def test_retry_recovers_completed_checkpoint_dict():
@@ -115,7 +119,15 @@ def test_retry_recovers_completed_checkpoint_dict():
 
             return SimpleNamespace(
                 next=(),
-                values={"structured_response": saved},
+                values={
+                    "messages": [
+                        HumanMessage(
+                            content="Check my refund",
+                            id=REQUEST_ID,
+                        )
+                    ],
+                    "structured_response": saved,
+                },
             )
 
     result = build_agent_input(
@@ -123,6 +135,7 @@ def test_retry_recovers_completed_checkpoint_dict():
         {"configurable": {"thread_id": "completed-dict-test"}},
         is_retry=True,
         user_text="Check my refund",
+    request_id=REQUEST_ID,
     )
 
     assert result is saved
@@ -132,7 +145,7 @@ def test_retry_recovers_completed_checkpoint_dict():
 
 def test_retry_recovers_completed_checkpoint_object():
     from types import SimpleNamespace
-    from objects import Answer
+    from agent.objects import Answer
 
     saved = Answer(
         answer="Your simulated refund ticket has been created.",
@@ -143,7 +156,15 @@ def test_retry_recovers_completed_checkpoint_object():
         def get_state(self, config):
             return SimpleNamespace(
                 next=(),
-                values={"structured_response": saved},
+                values={
+                    "messages": [
+                        HumanMessage(
+                            content="Check my refund",
+                            id=REQUEST_ID,
+                        )
+                    ],
+                    "structured_response": saved,
+                },
             )
 
     result = build_agent_input(
@@ -151,6 +172,7 @@ def test_retry_recovers_completed_checkpoint_object():
         {"configurable": {"thread_id": "completed-object-test"}},
         is_retry=True,
         user_text="Check my refund",
+    request_id=REQUEST_ID,
     )
 
     assert result is saved
@@ -170,7 +192,15 @@ def test_retry_rejects_completed_checkpoint_with_invalid_answer():
         def get_state(self, config):
             return SimpleNamespace(
                 next=(),
-                values={"structured_response": saved},
+                values={
+                    "messages": [
+                        HumanMessage(
+                            content="Check my refund",
+                            id=REQUEST_ID,
+                        )
+                    ],
+                    "structured_response": saved,
+                },
             )
 
     with pytest.raises(RuntimeError, match="valid structured answer"):
@@ -179,6 +209,7 @@ def test_retry_rejects_completed_checkpoint_with_invalid_answer():
             {"configurable": {"thread_id": "invalid-answer-test"}},
             is_retry=True,
             user_text="Check my refund",
+        request_id=REQUEST_ID,
         )
 
 
@@ -194,7 +225,15 @@ def test_retry_rejects_completed_checkpoint_with_invalid_conversation():
         def get_state(self, config):
             return SimpleNamespace(
                 next=(),
-                values={"structured_response": saved},
+                values={
+                    "messages": [
+                        HumanMessage(
+                            content="Check my refund",
+                            id=REQUEST_ID,
+                        )
+                    ],
+                    "structured_response": saved,
+                },
             )
 
     with pytest.raises(RuntimeError, match="invalid conversation field"):
@@ -203,6 +242,7 @@ def test_retry_rejects_completed_checkpoint_with_invalid_conversation():
             {"configurable": {"thread_id": "invalid-conversation-test"}},
             is_retry=True,
             user_text="Check my refund",
+        request_id=REQUEST_ID,
         )
 
 
@@ -211,7 +251,17 @@ def test_retry_rejects_completed_checkpoint_without_saved_response():
 
     class AgentWithCompletedCheckpoint:
         def get_state(self, config):
-            return SimpleNamespace(next=(), values={})
+            return SimpleNamespace(
+                next=(),
+                values={
+                    "messages": [
+                        HumanMessage(
+                            content="Check my refund",
+                            id=REQUEST_ID,
+                        )
+                    ]
+                },
+            )
 
     with pytest.raises(RuntimeError, match="no recoverable structured response"):
         build_agent_input(
@@ -219,6 +269,7 @@ def test_retry_rejects_completed_checkpoint_without_saved_response():
             {"configurable": {"thread_id": "missing-response-test"}},
             is_retry=True,
             user_text="Check my refund",
+        request_id=REQUEST_ID,
         )
 def test_retry_rejects_stale_completed_checkpoint():
     from types import SimpleNamespace
@@ -249,4 +300,20 @@ def test_retry_rejects_stale_completed_checkpoint():
             is_retry=True,
             user_text="Check my refund",
             request_id="new-request-id",
+        )
+
+def test_operation_rejects_missing_request_id():
+    class AgentWithoutCheckpoint:
+        def get_state(self, config):
+            raise AssertionError(
+                "Request ID must be checked before checkpoint access"
+            )
+
+    with pytest.raises(RuntimeError, match="non-empty request ID"):
+        build_agent_input(
+            AgentWithoutCheckpoint(),
+            {},
+            is_retry=False,
+            user_text="Check my refund",
+            request_id=" ",
         )

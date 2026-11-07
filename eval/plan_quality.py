@@ -1,25 +1,19 @@
-import sys
-from pathlib import Path
-from uuid import uuid4
+"""
+Retired standalone evaluation entry point.
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent"))
+The current AgentAudit evaluation architecture is maintained in:
+    python -m eval.eval_all
 
-from agent import agent
-from dataset import dataset
-from model import eval_model
+For deterministic application-side checks, use:
+    python -m eval.deterministic_benchmark
 
-from deepeval.metrics import PlanQualityMetric
-from deepeval.integrations.langchain import CallbackHandler
+This file is retained for historical reference. Its previous implementation
+is preserved in a timestamped .bak file.
+"""
 
-
-metrics = [PlanQualityMetric(threshold=0.8, model=eval_model, include_reason=True)]
-
-
-for golden in dataset.evals_iterator(metrics=metrics):
-    response = agent.invoke(
-        {"messages": [{"role": "user", "content": golden.input}]},
-        config={
-            "configurable": {"thread_id": str(uuid4())},
-            "callbacks": [CallbackHandler()],
-        },
+if __name__ == "__main__":
+    raise SystemExit(
+        "This standalone runner is retired. "
+        "Use `python -m eval.eval_all` for the current seven-metric evaluation. "
+        "Use `python -m eval.deterministic_benchmark` for deterministic checks."
     )

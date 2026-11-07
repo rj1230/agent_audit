@@ -1,49 +1,78 @@
+import argparse
 import sys
 from pathlib import Path
-from uuid import uuid4
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent"))
-
-from agent import agent
-from dataset import dataset
-from model import eval_model
-
-from deepeval.metrics import ArgumentCorrectnessMetric
-from deepeval.integrations.langchain import CallbackHandler
-from deepeval.test_case import LLMTestCase, ToolCall
-from deepeval import evaluate
 from dotenv import load_dotenv
 
-load_dotenv()
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-for golden in dataset.goldens:
-    response = agent.invoke(
-        {"messages": [{"role": "user", "content": golden.input}]},
-        config={
-            "configurable": {"thread_id": str(uuid4())},
-            "callbacks": [CallbackHandler()],
-        },
-    )
+load_dotenv(ROOT / ".env")
 
-    actual_output = response["structured_response"].answer
+from deepeval import evaluate
+from deepeval.metrics import ArgumentCorrectnessMetric
+from deepeval.test_case import LLMTestCase
 
-    tools_called = []
+from agent.agent import agent
+from eval.dataset import dataset
+from eval.evaluation_helpers import invoke_agent_for_golden
+from eval.model import eval_model
+
+
+def build_test_cases(case_number=None):
+    """Build isolated cases using confirmed executed tool calls."""
+    goldens = dataset.goldens
+
+    if case_number is not None:
+        if case_number < 1 or case_number > len(goldens):
+            raise ValueError(
+                f"Case number must be between 1 and {len(goldens)}."
+            )
+        selected_goldens = [goldens[case_number - 1]]
+    else:
+        selected_goldens = goldens
+
     test_cases = []
 
-    for message in response["messages"]:
-        for tool_call in getattr(message, "tool_calls", []) or []:
-            tools_called.append(
-                ToolCall(name=tool_call["name"], input_parameters=tool_call["args"])
+    for golden in selected_goldens:
+        response, tools_called = invoke_agent_for_golden(agent, golden)
+        structured_response = response["structured_response"]
+
+        test_cases.append(
+            LLMTestCase(
+                input=golden.input,
+                actual_output=structured_response.answer,
+                expected_output=golden.expected_output,
+                tools_called=tools_called,
+                expected_tools=list(golden.expected_tools or []),
             )
+        )
 
-    test_case = LLMTestCase(
-        input=golden.input, actual_output=actual_output, tools_called=tools_called
+    return test_cases
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Evaluate AgentAudit executed tool arguments."
     )
+    parser.add_argument(
+        "--case-number",
+        type=int,
+        help="Run one golden case (1-based). Default: all cases.",
+    )
+    args = parser.parse_args()
 
-    dataset.add_test_case(test_case)
+    test_cases = build_test_cases(args.case_number)
+    print(f"Prepared {len(test_cases)} isolated test case(s).")
 
-metrics = [
-    ArgumentCorrectnessMetric(threshold=0.8, model=eval_model, include_reason=True)
-]
+    metric = ArgumentCorrectnessMetric(
+        threshold=0.8,
+        model=eval_model,
+        include_reason=True,
+    )
+    evaluate(test_cases=test_cases, metrics=[metric])
 
-evaluate(test_cases=dataset.test_cases, metrics=metrics)
+
+if __name__ == "__main__":
+    main()
