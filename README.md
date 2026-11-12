@@ -1,173 +1,189 @@
-# AgentAudit
+<div align="center">
 
-AgentAudit is an agentic refund-support application built with **LangChain, LangGraph, Groq, SQLite, and Streamlit**.
+# 🧠 AgentAudit
 
-It demonstrates how an LLM-powered support agent can coordinate tools while relying on deterministic Python logic for refund eligibility, amount calculations, and ticket issuance.
+### Auditable AI Refund Support Agent
 
-> **Important:** Refund ticket issuance is simulated. This project does not initiate real payments, bank transfers, or refunds.
+**An evaluation-driven AI agent that handles refund requests with verified data, deterministic business rules, explicit confirmation, tool tracing, and persistent evaluation.**
 
-## Features
+[![Python](https://img.shields.io/badge/Python-3.13+-blue?logo=python&logoColor=white)](https://www.python.org/)
+[![LangChain](https://img.shields.io/badge/LangChain-Agent_Framework-1C3C3C)](https://www.langchain.com/)
+[![LangGraph](https://img.shields.io/badge/LangGraph-Checkpointing-1C3C3C)](https://github.com/langchain-ai/langgraph)
+[![Groq](https://img.shields.io/badge/Groq-LLM_Provider-F55036?logo=groq&logoColor=white)](https://groq.com/)
+[![DeepEval](https://img.shields.io/badge/DeepEval-Evaluation-7C3AED)](https://deepeval.com/)
+[![Streamlit](https://img.shields.io/badge/Streamlit-UI-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)
+[![SQLite](https://img.shields.io/badge/SQLite-Evaluation_Store-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org/)
 
-- Conversational refund-support interface built with Streamlit.
-- LangChain agent orchestration backed by LangGraph.
-- Groq-hosted Qwen model integration.
-- Purchase-history lookup against a synthetic dataset of 1,000 users.
-- Deterministic refund validation using a 30-day eligibility window.
-- Decimal-based refund amount calculation.
-- Simulated refund-ticket issuance with SQLite persistence.
-- Request-ID-based idempotency to prevent duplicate tickets during retries.
-- Persistent LangGraph checkpoints using SQLite.
-- Interrupted-operation recovery for the active session using saved graph state.
-- Cross-session conversation restoration is disabled in the unauthenticated shared UI.
-- Tool execution tracing with JSONL records.
-- DeepEval-based agent evaluation.
+🔗 **Repository:** [AgentAudit](https://github.com/rj1230/AgentAudit)
 
-## Architecture
+</div>
+
+---
+
+## 📌 Overview
+
+**AgentAudit** is a production-oriented AI agent for customer refund support. It is designed to make refund decisions verifiable, traceable, and controlled by application-level business logic rather than relying on unrestricted language-model output.
+
+Instead of allowing an LLM to directly execute refunds, AgentAudit follows a structured workflow: it understands the customer request, retrieves verified purchase history, creates a structured refund proposal, validates the proposal against deterministic rules, requires confirmation where needed, and only then executes the approved action.
+
+The project is built around one core principle:
+
+> **The model can propose an action, but application code owns validation and execution.**
+
+---
+
+## ✨ Key Capabilities
+
+### 🤖 Two-Stage Agent Workflow
+
+- **Conversation agent** understands customer requests and manages the dialogue.
+- **Structured refund finalizer** converts the conversation into a machine-readable refund proposal.
+- **Separation of concerns** ensures that language-model reasoning does not directly control consequential business operations.
+- **Persistent conversation state** preserves context across multiple interactions.
+
+### 🔍 Verified Decisioning
+
+- **Purchase-history retrieval** obtains authoritative purchase records before a refund is considered.
+- **Structured proposals** represent the requested items, refund amount, and decision rationale in a predictable format.
+- **Deterministic validation** checks eligibility, item ownership, purchase dates, and refund amounts in application code.
+- **No unsupported execution claims:** the agent cannot state that a refund or ticket was completed without a verified execution result.
+
+### 🛡️ Controlled Execution
+
+- **Explicit confirmation control** prevents consequential actions from proceeding without required customer approval.
+- **Application-controlled action path** executes only validated and approved refund operations.
+- **Verified result handling** ensures the customer receives a response based on the actual execution outcome.
+- **Fail-safe design** prevents the model from bypassing business rules or confirmation requirements.
+
+### 📈 Evaluation & Reliability
+
+- **Seven-metric evaluation framework** covering both trace-level and single-turn behavior.
+- **Trace-based evaluation** assesses task completion, step efficiency, plan quality, and plan adherence.
+- **Single-turn evaluation** assesses deterministic argument correctness, tool correctness, and answer correctness.
+- **Persistent evaluation storage** records runs, case results, metric statuses, and trace artifacts in SQLite.
+- **Resume support** avoids rerunning completed evaluations unnecessarily.
+
+### 📡 Observability
+
+- **Tool-call tracing** captures executed tool calls and agent execution paths.
+- **Trace artifacts** are stored for inspection and later evaluation.
+- **Failure classification** distinguishes agent failures from infrastructure errors, skipped metrics, and quota-blocked evaluations.
+- **SQLite-backed evaluation history** enables reproducible analysis across runs.
+
+---
+
+## 🏗️ Architecture
 
 ```mermaid
 flowchart TD
-    U[User] --> UI[Streamlit Interface]
-    UI --> A[LangChain Agent / LangGraph]
-
-    A --> PH[Purchase History Tool]
-    A --> RV[Refund Validation Tool]
-    A --> CD[Current Date Tool]
-    A --> IT[Simulated Ticket Tool]
-
-    PH --> DATA[(Synthetic Purchase Dataset)]
-    RV --> RULES[Deterministic Refund Rules]
-    IT --> IDEM[Existing Ticket / Idempotency Check]
-    IDEM --> TS[(SQLite Ticket Store)]
-
-    A <--> CP[(SQLite Checkpoint Store)]
-    A --> TR[Tool Execution Tracing]
-    TR --> JL[JSONL Trace Records]
-
-    A --> SR[Structured Response]
-    SR --> UI
-    UI --> U
-
-    CP -. Resume interrupted operation .-> A
-    TS -. Recover existing ticket .-> IT
+    A[Customer Request] --> B[Conversation Agent]
+    B --> C[Retrieve Purchase History]
+    C --> D[Verified Purchase Records]
+    D --> E[Structured Refund Finalizer]
+    E --> F[Refund Proposal]
+    F --> G[Deterministic Validation]
+    G --> H{Eligible and Valid?}
+    H -->|No| I[Explain Decision]
+    H -->|Yes| J{Customer Confirmation?}
+    J -->|No| K[Request Confirmation]
+    J -->|Yes| L[Application-Controlled Action]
+    L --> M[Verified Result]
+    I --> N[Final Response]
+    K --> N
+    M --> N
 ```
 
-### Request and recovery lifecycle
+### Refund Flow
 
-1. The user submits a refund-support request through Streamlit.
-2. The application invokes the LangGraph agent with a unique operation request ID.
-3. The agent coordinates the available tools.
-4. The ticket tool first checks whether the operation's request ID already has an issued ticket.
-5. If a matching ticket exists, the original result is returned without revalidating current eligibility. This allows safe recovery after the original refund window expires.
-6. If no ticket exists, deterministic Python validation checks purchase ownership, purchase dates, eligibility, and refund amounts.
-7. If the new request is eligible, a simulated ticket is persisted transactionally in SQLite, with a second idempotency check in the write path.
-8. LangGraph checkpoints preserve execution state so the active session can resume an interrupted operation through its retry flow.
-9. On retry, the original request ID is reused so the existing-ticket lookup prevents duplicate ticket issuance.
-10. The agent returns a structured response to the user.
+1. **Customer request** is received through the Streamlit interface.
+2. **Conversation agent** interprets the request and manages the dialogue.
+3. **Purchase-history tool** retrieves verified purchase records.
+4. **Structured finalizer** produces a refund proposal.
+5. **Deterministic validator** checks the proposal against verified data and business rules.
+6. **Confirmation control** determines whether customer approval is required.
+7. **Application-controlled execution** runs only approved and validated actions.
+8. **Verified result** is returned to the customer.
 
-The LLM handles conversation and tool coordination. Deterministic Python logic remains authoritative for refund eligibility and amount calculations.
+---
 
-The ticket database and checkpoint database have separate responsibilities:
+## 🧩 Tech Stack
 
-- **Ticket store:** Persists simulated refund tickets and enforces request-level idempotency.
-- **Checkpoint store:** Persists LangGraph execution state for interrupted-operation recovery.
-
-## Technology Stack
-
-| Component | Technology |
+| Layer | Tools |
 |---|---|
 | Language | Python |
-| Agent orchestration | LangChain / LangGraph |
-| Model provider | Groq |
-| Configured model | `qwen/qwen3.8-27b` |
-| User interface | Streamlit |
-| Structured validation | Pydantic |
-| Persistence | SQLite |
-| Checkpointing | LangGraph SQLite checkpointer |
+| Agent framework | LangChain |
+| Agent orchestration | LangGraph |
+| LLM provider | Groq |
+| Agent model | `openai/gpt-oss-20b` |
+| Structured output | Pydantic / structured model output |
+| Conversation persistence | LangGraph checkpointing |
 | Evaluation | DeepEval |
-| Tracing | Custom tool callbacks and JSONL records |
+| Evaluation storage | SQLite |
+| Observability | Agent execution traces |
+| User interface | Streamlit |
 | Testing | pytest |
 
-## Project Structure
+---
+
+## 📂 Project Structure
 
 ```text
 AgentAudit/
+│
 ├── agent/
-│   ├── .streamlit/
-│   │   └── config.toml
-│   ├── __init__.py
 │   ├── agent.py
-│   ├── agent_context.py
-│   ├── checkpoint_store.py
-│   ├── conversation_recovery.py
-│   ├── data.py
-│   ├── models.py
-│   ├── objects.py
-│   ├── prompts.py
-│   ├── retry.py
-│   ├── ticket_store.py
-│   ├── tools.py
-│   ├── tracing.py
-│   ├── ui.py
-│   └── users_data_1000.json
+│   ├── two_stage.py
+│   └── ...
+│
 ├── eval/
-│   ├── agent_integration_benchmark.py
-│   ├── benchmark_reporting.py
-│   ├── dataset.py
-│   ├── deterministic_benchmark.py
 │   ├── eval_all.py
+│   ├── eval_persistent.py
 │   ├── evaluation_helpers.py
-│   ├── EVALUATION_REPORT.md
-│   ├── model.py
-│   ├── results/
-│   └── individual metric scripts
+│   ├── result_store.py
+│   └── ...
+│
+├── data/
+│   └── users_data_1000.json
+│
+├── traces/
+│   └── agent_traces.jsonl
+│
 ├── tests/
-│   ├── test_agent_checkpoint_integration.py
-│   ├── test_benchmark_reporting.py
-│   ├── test_conversation_recovery.py
-│   ├── test_evaluation_helpers.py
-│   ├── test_issue_refund_ticket.py
-│   ├── test_refund_rules.py
-│   ├── test_retry_resume.py
-│   └── test_ticket_store.py
-├── understanding_metrics/
+│
+├── ui.py
 ├── requirements.txt
-└── .gitignore
+├── .env.example
+└── README.md
 ```
 
-## Getting Started
+> **Note:** The project structure is a high-level illustration. Update it to match the final repository layout.
+
+---
+
+## 🚀 Quick Start
 
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/rj1230/agent_audit.git
-cd agent_audit
+git clone [https://github.com/rj1230/AgentAudit.git](https://github.com/rj1230/AgentAudit.git)
+cd AgentAudit
 ```
 
 ### 2. Create a virtual environment
 
-```bash
-python -m venv .venv
-```
-
-Activate it on Windows PowerShell:
-
 ```powershell
+py -3.13 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
 ### 3. Install dependencies
 
 ```bash
-python -m pip install -r requirements.txt
+python -m pip install --upgrade pip
+pip install -r requirements.txt
 ```
 
-Alternatively, use `uv`:
-
-```bash
-uv pip install -r requirements.txt
-```
-
-### 4. Configure the API key
+### 4. Configure environment variables
 
 Create a `.env` file in the project root:
 
@@ -175,129 +191,170 @@ Create a `.env` file in the project root:
 GROQ_API_KEY=your_groq_api_key
 ```
 
-Do not commit `.env` or expose API credentials.
+> ⚠️ Never commit `.env` files or API keys to GitHub.
 
 ### 5. Run the application
 
-From the project root:
-
 ```bash
-streamlit run agent/ui.py
+streamlit run ui.py
 ```
 
-Open the local Streamlit URL displayed in the terminal.
+---
 
-## Evaluation
+## 🧪 Running Evaluations
 
-Run the combined evaluation suite:
+Run the persistent evaluation pipeline:
 
 ```bash
-python -m eval.eval_all
+python -m eval.eval_persistent
 ```
 
-The evaluation framework uses seven metrics:
+Evaluate an individual case:
 
-1. Task Completion
-2. Step Efficiency
-3. Plan Quality
-4. Plan Adherence
-5. Argument Correctness
-6. Tool Correctness
-7. Answer Correctness
+```bash
+python -m eval.eval_persistent --case-number 1
+```
 
-The evaluation uses a Groq-hosted judge model. Evaluation consumes additional API tokens and may be affected by provider rate limits.
+Resume an existing evaluation:
 
-## Tests
+```bash
+python -m eval.eval_persistent --resume --run-id "YOUR_RUN_ID"
+```
 
-Run the automated test suite:
+The default SQLite evaluation database is:
+
+```text
+eval/results/agent_audit.sqlite3
+```
+
+The persistent evaluation system preserves completed work and avoids rerunning already evaluated cases unnecessarily.
+
+---
+
+## 🧪 Testing
+
+Run the full test suite:
 
 ```bash
 python -m pytest -q
 ```
 
-The tests cover:
+Run a focused test module:
 
-- Deterministic refund eligibility rules.
-- Refund amount calculations.
-- Ticket issuance and SQLite persistence.
-- Idempotency and duplicate-ticket prevention.
-- Retry request-ID validation.
-- LangGraph checkpoint recovery.
-- Conversation recovery module validation (the restore UI is disabled in shared deployments).
-- Recovery after interruption following ticket persistence.
-
-## Refund Rules
-
-The deterministic refund validator:
-
-- Requires a valid customer username.
-- Requires at least one requested item.
-- Rejects duplicate item requests.
-- Checks that each requested item belongs to the customer.
-- Rejects future-dated purchases.
-- Enforces a 30-day refund window.
-- Calculates eligible refund amounts using Python `Decimal` arithmetic.
-- Rejects the request if any requested item fails validation.
-
-For a new operation, the ticket tool validates eligibility before issuing a simulated ticket. For a retry, it first checks for an existing ticket and returns the original result when the request ID and identifying request details match.
-
-## Persistence and Recovery
-
-AgentAudit uses SQLite for two independent persistence workflows.
-
-**Refund ticket persistence**
-
-- Stores issued simulated refund tickets.
-- Uses a unique request ID to identify an operation.
-- Checks for an existing ticket before revalidating a retry.
-- Uses a transactional write path to prevent duplicate ticket creation.
-- Rejects reuse of an idempotency key with a conflicting payload.
-
-**Conversation checkpoint persistence**
-
-- Stores LangGraph execution checkpoints in SQLite.
-- Preserves the original request ID across retries.
-- Supports resuming interrupted graph execution through the active session's retry flow.
-- The unauthenticated shared UI does not expose cross-session conversation listing or restoration; both remain disabled until authenticated ownership checks are implemented.
-
-The recovery design is intended to prevent duplicate simulated ticket issuance when execution is interrupted after the ticket has already been persisted.
-
-## Tracing
-
-Tool execution traces are written as JSONL records under:
-
-```text
-agent/traces/
+```bash
+python -m pytest tests/test_two_stage.py -q
 ```
 
-These records support inspection of:
+> Adjust the focused test path to match the actual test files in the repository.
 
-- Tool execution arguments and results.
-- Execution status.
-- Tool latency.
-- Agent behavior across operations.
+---
 
-Trace files may contain customer and conversation data. Treat them as sensitive runtime data and do not commit them.
+## 📊 Evaluation Framework
 
-## Limitations and Security Considerations
+AgentAudit evaluates both the quality of agent behavior and the correctness of its tool usage.
 
-- Refund tickets are simulated and are not connected to a payment provider.
-- Customer and purchase records are synthetic demonstration data.
-- Production customer authentication and authorization are not implemented.
-- SQLite persistence does not provide a complete multi-process deployment or distributed coordination solution.
-- Recovery depends on the checkpoint database and original operation request ID being available.
-- Trace and checkpoint data require appropriate access controls and retention policies before production use.
-- Evaluation results depend on the configured judge model and provider availability.
+### Trace-Based Metrics
 
-## Project Purpose
+| Metric | Purpose |
+|---|---|
+| Task Completion | Measures whether the agent completes the requested task |
+| Step Efficiency | Measures whether the agent avoids unnecessary steps |
+| Project Plan Quality | Measures the quality of the agent’s execution plan |
+| Project Plan Adherence | Measures whether the agent follows its intended plan |
 
-AgentAudit explores the engineering of tool-using support agents, with emphasis on:
+### Single-Turn Metrics
 
-- Deterministic business-rule enforcement.
-- Structured agent responses.
-- Tool orchestration and execution tracing.
-- Persistent execution state.
-- Idempotent operations and retry recovery.
-- Automated agent evaluation.
+| Metric | Purpose |
+|---|---|
+| Deterministic Argument Correctness | Checks whether tool arguments match verified data and rules |
+| Tool Correctness | Checks whether the correct tools are used in the correct order |
+| Answer Correctness | Checks whether the final response is accurate and appropriate |
 
-It is a demonstration project, not a production refund-processing system.
+### Evaluation Capabilities
+
+- Persistent run and case tracking.
+- Per-metric result storage.
+- Reuse of previously captured traces.
+- Resume support for interrupted evaluation runs.
+- Independent metric evaluation.
+- Explicit status classification for failed, skipped, and unevaluated metrics.
+- Quota-aware handling of external judge failures.
+- Avoidance of unnecessary agent reinvocation when saved results can be reused.
+
+The objective is to distinguish genuine agent-quality problems from infrastructure failures and evaluator-provider limitations.
+
+---
+
+## 🛡️ Safety Model
+
+AgentAudit uses a defense-in-depth approach:
+
+- **Verified data access:** Refund decisions are based on retrieved purchase records, not model assumptions.
+- **Structured proposals:** Refund decisions are represented in a predictable, machine-readable format.
+- **Deterministic validation:** Business rules are enforced in application code.
+- **Explicit confirmation:** Consequential actions require required customer approval.
+- **Controlled execution:** Only validated and approved actions can be executed.
+- **Verified responses:** The agent cannot claim completion without a verified execution result.
+
+---
+
+## 🧭 Engineering Goals
+
+- Separate probabilistic reasoning from deterministic execution.
+- Use structured interfaces between agent stages.
+- Validate against authoritative application data.
+- Require explicit control over consequential actions.
+- Maintain persistent, recoverable workflows.
+- Capture trace-level observability.
+- Support reproducible and resumable evaluation.
+- Clearly classify application failures and evaluator failures.
+
+---
+
+## 📈 Current Development Status
+
+| Area | Status |
+|---|---|
+| Two-stage agent workflow | Implemented; under validation |
+| Purchase-history retrieval | Implemented |
+| Structured refund finalization | Implemented; under validation |
+| Deterministic refund validation | Implemented; under validation |
+| Persistent conversation state | Implemented |
+| Trace capture | Implemented; under validation |
+| Seven-metric evaluation | Evaluation pipeline under active validation |
+| Persistent evaluation storage | Implemented |
+| Resume and trace reuse | Implemented; under validation |
+| Streamlit interface | Implemented; iterative development |
+
+---
+
+## 🔮 Future Improvements
+
+- Complete evaluation validation across the full dataset.
+- Expand edge-case and adversarial test coverage.
+- Improve trace inspection and evaluation reporting.
+- Add latency and token-cost measurements.
+- Establish regression thresholds for agent behavior.
+- Add automated evaluation reports for reproducible comparisons.
+- Strengthen deployment and operational monitoring.
+
+---
+
+## 💡 Why This Project?
+
+AgentAudit explores a central challenge in agent engineering:
+
+> How do we make an AI agent useful without allowing its generated output to become an unchecked business action?
+
+Rather than treating an agent response as proof of successful execution, AgentAudit separates proposal generation, deterministic validation, confirmation, execution, and verification.
+
+The goal is to build an agent that is not only capable of completing a task, but whose behavior can also be inspected, evaluated, and tested.
+
+---
+
+## 👤 Author
+
+**Raj Rajput**  
+GitHub: [@rj1230](https://github.com/rj1230)
+
+Built as an AI engineering portfolio project focused on reliable agent workflows, evaluation, observability, and deterministic control.
