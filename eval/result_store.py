@@ -191,8 +191,8 @@ class ResultStore:
                     case_number = excluded.case_number,
                     input = excluded.input,
                     expected_output = excluded.expected_output,
-                    actual_output = excluded.actual_output,
-                    tools_called_json = excluded.tools_called_json,
+                    actual_output = COALESCE(excluded.actual_output, cases.actual_output),
+                    tools_called_json = COALESCE(excluded.tools_called_json, cases.tools_called_json),
                     invocation_status = excluded.invocation_status,
                     invocation_error = excluded.invocation_error,
                     updated_at = excluded.updated_at

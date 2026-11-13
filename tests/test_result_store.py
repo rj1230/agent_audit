@@ -51,6 +51,56 @@ def test_case_round_trip(store):
     assert case["tools_called"][0]["name"] == "lookup"
 
 
+def test_case_error_update_preserves_previous_output_and_tools(store):
+    original_tools = [
+        {"name": "lookup_purchase", "input_parameters": {"user_id": "user123"}}
+    ]
+
+    store.save_case(
+        "test-run", "case-001", 1, "input", "expected",
+        actual_output="Previously completed answer",
+        tools_called=original_tools,
+        invocation_status="COMPLETED",
+    )
+
+    # A failed retry updates its status but supplies no replacement output.
+    store.save_case(
+        "test-run", "case-001", 1, "input", "expected",
+        invocation_status="ERROR",
+        invocation_error="Temporary invocation failure",
+    )
+
+    case = store.get_case("test-run", "case-001")
+
+    assert case["actual_output"] == "Previously completed answer"
+    assert case["tools_called"] == original_tools
+    assert case["invocation_status"] == "ERROR"
+    assert case["invocation_error"] == "Temporary invocation failure"
+
+
+def test_case_upsert_replaces_output_when_new_values_are_provided(store):
+    store.save_case(
+        "test-run", "case-001", 1, "input", "expected",
+        actual_output="Old answer",
+        tools_called=[{"name": "old_tool", "input_parameters": {}}],
+        invocation_status="COMPLETED",
+    )
+
+    new_tools = [{"name": "new_tool", "input_parameters": {"id": 2}}]
+
+    store.save_case(
+        "test-run", "case-001", 1, "input", "expected",
+        actual_output="New answer",
+        tools_called=new_tools,
+        invocation_status="COMPLETED",
+    )
+
+    case = store.get_case("test-run", "case-001")
+
+    assert case["actual_output"] == "New answer"
+    assert case["tools_called"] == new_tools
+    assert case["invocation_status"] == "COMPLETED"
+
 @pytest.mark.parametrize(
     ("status", "score", "error"),
     [
