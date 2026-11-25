@@ -39,3 +39,7 @@ Thumbs.db
 
 # Local benchmark run artifacts
 /eval/results/
+
+*.bak*
+*.backup-*
+backups/
