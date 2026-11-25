@@ -43,3 +43,4 @@ Thumbs.db
 *.bak*
 *.backup-*
 backups/
+agent_ui_redesigned.py
