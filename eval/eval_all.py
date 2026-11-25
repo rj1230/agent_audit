@@ -7,7 +7,6 @@ from deepeval import evaluate
 from deepeval.dataset import EvaluationDataset
 from deepeval.evaluate import AsyncConfig, CacheConfig, DisplayConfig
 from deepeval.metrics import (
-    ArgumentCorrectnessMetric,
     GEval,
     PlanAdherenceMetric,
 
@@ -33,6 +32,139 @@ else:
     from plan_adherence_metric import ProjectPlanAdherenceMetric
     from plan_quality_template import ProjectPlanQualityMetric
     from task_completion_template import ProjectTaskCompletionTemplate
+
+
+
+def deterministic_argument_result(expected_tools, actual_tools, threshold=0.8):
+    """Compare arguments using optimal one-to-one matching per tool name."""
+
+    def read_field(call, field, default=None):
+        if isinstance(call, dict):
+            return call.get(field, default)
+        return getattr(call, field, default)
+
+    expected_by_name = {}
+    actual_by_name = {}
+
+    for call in expected_tools or []:
+        name = read_field(call, "name")
+        if name:
+            expected_by_name.setdefault(name, []).append(call)
+
+    for call in actual_tools or []:
+        name = read_field(call, "name")
+        if name:
+            actual_by_name.setdefault(name, []).append(call)
+
+    comparisons = []
+    comparable_calls = 0
+
+    for name, expected_calls in expected_by_name.items():
+        actual_calls = actual_by_name.get(name, [])
+        pair_count = min(len(expected_calls), len(actual_calls))
+
+        if pair_count == 0:
+            continue
+
+        comparable_calls += pair_count
+        pair_scores = []
+
+        for expected_call in expected_calls:
+            expected_args = read_field(
+                expected_call, "input_parameters", {}
+            ) or {}
+            if not isinstance(expected_args, dict):
+                raise TypeError(
+                    f"Expected arguments for {name} must be a dictionary."
+                )
+
+            row = []
+            for actual_call in actual_calls:
+                actual_args = read_field(
+                    actual_call, "input_parameters", {}
+                ) or {}
+                if not isinstance(actual_args, dict):
+                    raise TypeError(
+                        f"Actual arguments for {name} must be a dictionary."
+                    )
+
+                keys = set(expected_args) | set(actual_args)
+                if not keys:
+                    row.append((1, 1))
+                else:
+                    matches = sum(
+                        key in expected_args
+                        and key in actual_args
+                        and expected_args[key] == actual_args[key]
+                        for key in keys
+                    )
+                    row.append((matches, len(keys)))
+            pair_scores.append(row)
+
+        # DP explores one-to-one assignments and maximizes the aggregate
+        # argument-match ratio, rather than making greedy local choices.
+        states = {(0, 0, 0)}
+
+        for row in pair_scores:
+            next_states = set(states)
+            for mask, matched_so_far, total_so_far in states:
+                if mask.bit_count() >= pair_count:
+                    continue
+
+                for actual_index, (matches, total) in enumerate(row):
+                    bit = 1 << actual_index
+                    if mask & bit:
+                        continue
+
+                    next_states.add((
+                        mask | bit,
+                        matched_so_far + matches,
+                        total_so_far + total,
+                    ))
+            states = next_states
+
+        valid = [
+            (matched, total)
+            for mask, matched, total in states
+            if mask.bit_count() == pair_count
+        ]
+
+        if valid:
+            comparisons.append(
+                max(valid, key=lambda item: item[0] / item[1])
+            )
+
+    if not comparisons:
+        return {
+            "status": "SKIPPED",
+            "score": None,
+            "reason": (
+                "No actual tool call shared a name with an expected tool call. "
+                "Tool selection is evaluated separately."
+            ),
+        }
+
+    matched = sum(item[0] for item in comparisons)
+    total = sum(item[1] for item in comparisons)
+    score = matched / total
+
+    return {
+        "status": "PASS" if score >= threshold else "FAIL",
+        "score": score,
+        "reason": (
+            f"Matched {matched} of {total} argument key/value comparisons "
+            f"across {comparable_calls} comparable tool call(s). "
+            f"Threshold: {threshold:.2f}."
+        ),
+    }
+
+
+class DeterministicArgumentCorrectnessMetric:
+    """Marker/configuration for the locally evaluated argument metric."""
+
+    name = "Argument Correctness"
+    threshold = 0.8
+    deterministic = True
 
 
 SUCCESSFUL_TASK_DESCRIPTION = """
@@ -87,11 +219,7 @@ def build_metrics():
         ),
     ]
     single_turn_metrics = [
-        ArgumentCorrectnessMetric(
-            threshold=0.8,
-            model=eval_model,
-            include_reason=True,
-        ),
+        DeterministicArgumentCorrectnessMetric(),
         ToolCorrectnessMetric(
             threshold=0.9,
             model=eval_model,
@@ -188,9 +316,37 @@ def main():
             )
         )
 
+    deterministic_metrics = [
+        metric for metric in single_turn_metrics
+        if getattr(metric, "deterministic", False)
+    ]
+    judge_metrics = [
+        metric for metric in single_turn_metrics
+        if not getattr(metric, "deterministic", False)
+    ]
+
+    for metric in deterministic_metrics:
+        print(f"\\n=== {metric.name} (DETERMINISTIC) ===")
+        for index, (golden, test_case) in enumerate(
+            zip(selected_goldens, test_cases), start=1
+        ):
+            result = deterministic_argument_result(
+                expected_tools=golden.expected_tools or [],
+                actual_tools=test_case.tools_called or [],
+                threshold=metric.threshold,
+            )
+            score_text = (
+                "n/a" if result["score"] is None
+                else f"{result['score']:.2f}"
+            )
+            print(
+                f"Case {index}: {result['status']} | "
+                f"score={score_text} | {result['reason']}"
+            )
+
     evaluation_result = evaluate(
         test_cases=test_cases,
-        metrics=single_turn_metrics,
+        metrics=judge_metrics,
         async_config=async_config,
         cache_config=cache_config,
         display_config=display_config,

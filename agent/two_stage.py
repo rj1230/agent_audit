@@ -28,7 +28,7 @@ from agent.objects import (
     RefundProposal,
 )
 from agent.prompts import agent_system_prompt
-from agent.tools import get_user_purchase_history, parse_purchase_date
+from agent.tools import get_user_purchase_history, parse_purchase_date, validate_refund
 
 
 logger = logging.getLogger(__name__)
@@ -68,9 +68,9 @@ def _contains_unsupported_success_claim(answer: str) -> bool:
     """
     patterns = (
         # Refund approval, processing, issuance, completion, or submission.
-        r"\b(?:your\s+)?refund(?:\s+request(?:\s+for\s+[^.!?;,:]+?)?)?\s+"
+        r"\b(?:your\s+)?refund(?:\s+request)?(?:\s+for\s+[^.!?;,:]+?)?\s+"
         r"(?:(?:has|was|is)\s+been|was|is)\s+"
-        r"(?:approved|processed|issued|completed|sent|transferred|submitted)\b",
+        r"(?:approved|processed|issued|completed|sent|transferred|submitted|forwarded)\b",
 
         # Ticket creation or submission.
         r"\b(?:your\s+)?ticket\s+(?:(?:has|was|is)\s+been|was|is)\s+"
@@ -196,7 +196,7 @@ def _customer_requested_item(
     messages: list,
     item_name: str,
 ) -> bool:
-    """Require an exact item mention and affirmative refund intent."""
+    """Require item-specific affirmative refund intent without conflicting negation."""
     expected = _normalise_item_name(item_name)
 
     if not expected:
@@ -207,13 +207,20 @@ def _customer_requested_item(
     negative_intent_patterns = (
         r"\b(?:do not|don't|does not|doesn't|did not|didn't|"
         r"never|cannot|can't|will not|won't)\s+"
-        r"(?:(?:want|wish|need|intend|plan)\s+to\s+)?"
+        r"(?:(?:want|wish|need|intend|plan)\s+(?:to\s+)?)?"
+        r"(?:a\s+)?"
         r"(?:return|refund|send back)\b",
         r"\bnot\s+(?:returning|refunding|sending back)\b",
         r"\bno\s+refund\b",
     )
 
     positive_intent_pattern = r"\b(?:return|refund|send back)\b"
+    clause_boundary_pattern = (
+        r"\b(?:but|however|whereas|although|though|except)\b|[;,.!?]"
+    )
+
+    saw_positive_intent = False
+    saw_negative_intent = False
 
     for message in messages:
         if not isinstance(message, HumanMessage):
@@ -238,17 +245,23 @@ def _customer_requested_item(
         ):
             continue
 
-        if not re.search(item_pattern, normalized):
-            continue
+        # Evaluate intent only in clauses that mention this exact item.
+        clauses = re.split(clause_boundary_pattern, normalized)
 
-        if any(re.search(pattern, normalized) for pattern in negative_intent_patterns):
-            continue
+        for clause in clauses:
+            if not re.search(item_pattern, clause):
+                continue
 
-        if re.search(positive_intent_pattern, normalized):
-            return True
+            if any(
+                re.search(pattern, clause)
+                for pattern in negative_intent_patterns
+            ):
+                saw_negative_intent = True
+            elif re.search(positive_intent_pattern, clause):
+                saw_positive_intent = True
 
-    return False
-
+    # Conflicting intent for the same item is rejected conservatively.
+    return saw_positive_intent and not saw_negative_intent
 
 def _begin_turn(state: RefundAgentState) -> dict:
     """Clear verification data when a new user turn starts."""
@@ -493,17 +506,201 @@ def _record_tool_result(
     }
 
 
+def _eligibility_inquiry_answer(
+    messages: list,
+    lookup_status: str,
+    verified_username: str | None,
+    purchase_history: dict[str, Any] | None,
+) -> str | None:
+    """Answer explicit item-eligibility questions using deterministic policy."""
+    if (
+        lookup_status != "verified"
+        or not verified_username
+        or not isinstance(purchase_history, dict)
+    ):
+        return None
+
+    latest_customer_message = next(
+        (
+            message
+            for message in reversed(messages)
+            if isinstance(message, HumanMessage)
+        ),
+        None,
+    )
+
+    if latest_customer_message is None or not isinstance(
+        latest_customer_message.content, str
+    ):
+        return None
+
+    customer_text = latest_customer_message.content
+    normalized_text = re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[^\w]+", " ", customer_text.casefold()),
+    ).strip()
+
+    eligibility_patterns = (
+        r"\beligible\b",
+        r"\beligibility\b",
+        r"\brefundable\b",
+        r"\brefund\s+window\b",
+        r"\bqualif(?:y|ies|ied|ication)\b",
+        r"\bwithin\s+(?:the\s+)?30\s+days?\b",
+        r"\b(?:can|could|would|should|do)\s+i\b.{0,80}\brefund\b",
+        r"\bpossible\s+to\s+get\s+(?:a\s+)?refund\b",
+    )
+
+    if not any(
+        re.search(pattern, normalized_text)
+        for pattern in eligibility_patterns
+    ):
+        return None
+
+    # Match only exact verified item names. Prefer longer names when one
+    # item name is contained within another.
+    candidates = []
+    for item_name in purchase_history:
+        if not isinstance(item_name, str) or not item_name.strip():
+            continue
+
+        normalized_item = re.sub(
+            r"\s+",
+            " ",
+            re.sub(r"[^\w]+", " ", item_name.casefold()),
+        ).strip()
+
+        if not normalized_item:
+            continue
+
+        match = re.search(
+            rf"(?<!\w){re.escape(normalized_item)}(?!\w)",
+            normalized_text,
+        )
+        if match:
+            candidates.append(
+                (match.start(), match.end(), item_name, len(normalized_item))
+            )
+
+    selected = []
+    occupied_spans = []
+
+    for start, end, item_name, _length in sorted(
+        candidates,
+        key=lambda candidate: (
+            -candidate[3],
+            candidate[0],
+        ),
+    ):
+        overlaps = any(
+            start < existing_end and end > existing_start
+            for existing_start, existing_end in occupied_spans
+        )
+        if not overlaps:
+            selected.append((start, item_name))
+            occupied_spans.append((start, end))
+
+    selected.sort(key=lambda item: item[0])
+    requested_items = [item_name for _, item_name in selected]
+
+    if not requested_items:
+        return (
+            "I can check refund eligibility using the 30-day policy. "
+            "Which exact purchased item would you like me to check? "
+            "This check does not create a refund proposal or ticket."
+        )
+
+    lines = []
+
+    for item_name in requested_items:
+        result = validate_refund(
+            verified_username,
+            [PurchaseItem(name=item_name)],
+        )
+
+        if not isinstance(result, dict):
+            lines.append(
+                f"- {item_name}: I couldn't verify the eligibility result."
+            )
+            continue
+
+        if result.get("eligible") is True:
+            validated_items = result.get("items") or []
+            item_result = (
+                validated_items[0]
+                if validated_items and isinstance(validated_items[0], dict)
+                else {}
+            )
+            purchase_date = item_result.get("purchase_date")
+            purchase_price = item_result.get("price")
+
+            details = []
+            if purchase_date is not None:
+                details.append(f"purchase date: {purchase_date}")
+            if purchase_price is not None:
+                details.append(f"recorded price: {purchase_price}")
+
+            detail_text = (
+                f" ({'; '.join(details)})" if details else ""
+            )
+            lines.append(
+                f"- {item_name}: Eligible under the 30-day policy "
+                f"for refund review{detail_text}."
+            )
+        else:
+            reason = str(
+                result.get("reason")
+                or "The item did not pass the refund policy check."
+            )
+            lines.append(
+                f"- {item_name}: Not eligible under the 30-day policy. "
+                f"{reason}."
+            )
+
+    return (
+        "Here is the deterministic eligibility check based on the "
+        "verified purchase history:\n"
+        + "\n".join(lines)
+        + "\nThis is an informational eligibility check only. "
+        "No refund proposal, approval, or ticket has been created."
+    )
+
+
 def _finalizer_node(
     state: RefundAgentState,
     config: RunnableConfig,
 ) -> dict:
     """Produce strict output without exposing any tools to this model call."""
+    lookup_status = state.get("lookup_status", "not_attempted")
+    verified_username = state.get("verified_username")
+    identity_verified = (
+        lookup_status == "verified"
+        and isinstance(verified_username, str)
+        and bool(verified_username.strip())
+    )
+
+    raw_purchase_history = state.get("purchase_history")
+    trusted_purchase_history = (
+        raw_purchase_history
+        if identity_verified and isinstance(raw_purchase_history, dict)
+        else {}
+    )
+
+    verified_purchase_records = [
+        {
+            "item": item_name,
+            "purchase_date": purchase.get("date"),
+            "purchase_price": purchase.get("price"),
+        }
+        for item_name, purchase in trusted_purchase_history.items()
+        if isinstance(item_name, str) and isinstance(purchase, dict)
+    ]
+
     trusted_context = {
-        "lookup_status": state.get("lookup_status", "not_attempted"),
-        "verified_username": state.get("verified_username"),
-        "verified_purchase_item_names": (
-            list((state.get("purchase_history") or {}).keys())
-        ),
+        "lookup_status": lookup_status,
+        "verified_username": verified_username if identity_verified else None,
+        "verified_purchase_records": verified_purchase_records,
     }
 
     instructions = SystemMessage(
@@ -524,31 +721,64 @@ def _finalizer_node(
         )
     )
 
-    result = _invoke_with_provider_diagnostics(
-        "finalizer", finalizer, [instructions, *state["messages"]], config
-    )
+    # Groq Structured Outputs must not receive tool-protocol messages.
+    # Keep customer messages and ordinary assistant replies only.
+    finalizer_messages = [
+        message
+        for message in state["messages"]
+        if isinstance(message, HumanMessage)
+        or (
+            isinstance(message, AIMessage)
+            and not message.tool_calls
+        )
+    ]
 
-    if not isinstance(result, dict):
-        raise TypeError("Structured finalizer returned an unexpected result.")
+    def safe_finalizer_fallback():
+        return {
+            "structured_response": Answer(
+                answer=(
+                    "I couldn't safely complete your refund-support response "
+                    "because the final response could not be generated. "
+                    "No refund proposal was prepared, and no refund action "
+                    "was taken. Please try again."
+                ),
+                conversation=True,
+                refund_proposal=None,
+            )
+        }
 
-    if result.get("parsing_error") is not None:
-        raise ValueError("Strict finalizer output could not be parsed.")
+    try:
+        result = _invoke_with_provider_diagnostics(
+            "finalizer", finalizer, [instructions, *finalizer_messages], config
+        )
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Finalizer provider invocation failed; returning safe fallback."
+        )
+        return safe_finalizer_fallback()
 
-    parsed = result.get("parsed")
+    if (
+        not isinstance(result, dict)
+        or result.get("parsing_error") is not None
+        or not isinstance(result.get("parsed"), FinalAnswerOutput)
+    ):
+        logging.getLogger(__name__).error(
+            "Finalizer returned malformed structured output; "
+            "returning safe fallback."
+        )
+        return safe_finalizer_fallback()
 
-    if not isinstance(parsed, FinalAnswerOutput):
-        raise TypeError("Strict finalizer did not return FinalAnswerOutput.")
+    parsed = result["parsed"]
 
     proposal = parsed.refund_proposal
 
     if proposal is not None:
         # No proposal is permitted without a successful lookup.
-        if state.get("lookup_status") != "verified":
+        if not identity_verified:
             proposal = None
 
         else:
-            verified_username = state.get("verified_username")
-            purchase_history = state.get("purchase_history") or {}
+            purchase_history = trusted_purchase_history
 
             if proposal.username != verified_username:
                 proposal = None
@@ -604,12 +834,23 @@ def _finalizer_node(
     # This graph stage cannot approve refunds or create tickets.
     # Never pass affirmative completion claims to either application UI.
     if _contains_unsupported_success_claim(answer_text):
-        answer_text = (
-            "I can't confirm that a refund has been approved or a ticket "
-            "created. No refund action has been completed by this agent. "
-            "Any refund proposal must first pass application validation "
-            "and your explicit confirmation."
-        )
+        if proposal is not None:
+            proposed_item_names = ", ".join(
+                item.name for item in proposal.items
+            )
+            answer_text = (
+                f"I've prepared a refund proposal for {proposed_item_names}. "
+                "It has not been submitted or approved. The application "
+                "must independently validate eligibility, and your explicit "
+                "confirmation is required before any refund action."
+            )
+        else:
+            answer_text = (
+                "I can't confirm that a refund has been approved or a ticket "
+                "created. No refund action has been completed by this agent. "
+                "Any refund proposal must first pass application validation "
+                "and your explicit confirmation."
+            )
 
     # If the model proposed a refund but application validation rejected it,
     # discard its associated success language as well.
@@ -622,6 +863,18 @@ def _finalizer_node(
             "customer or purchased item. No refund proposal was prepared, "
             "and no ticket was created."
         )
+
+    # Do not let free-form model text decide eligibility. This path is
+    # limited to explicit eligibility questions with exact verified items.
+    if parsed.refund_proposal is None and proposal is None and not proposal_rejected:
+        deterministic_eligibility_answer = _eligibility_inquiry_answer(
+            messages=state["messages"],
+            lookup_status=lookup_status,
+            verified_username=verified_username if identity_verified else None,
+            purchase_history=trusted_purchase_history,
+        )
+        if deterministic_eligibility_answer is not None:
+            answer_text = deterministic_eligibility_answer
 
     answer = Answer(
         answer=answer_text,

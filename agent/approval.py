@@ -50,6 +50,7 @@ def _record_approval_event(
 def confirm_pending_approval(
     session_state: Any,
     *,
+    confirmed: bool,
     ticket_issuer: Callable[..., dict],
     logger: logging.Logger,
 ) -> None:
@@ -58,6 +59,10 @@ def confirm_pending_approval(
     Exceptions and malformed responses retain the approval for retry.
     The ticket issuer remains responsible for idempotency and quote validation.
     """
+    # Fail closed unless explicit Boolean confirmation is supplied.
+    if confirmed is not True:
+        return
+
     approval = session_state.pending_approval
 
     if not isinstance(approval, dict):

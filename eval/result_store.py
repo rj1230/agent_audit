@@ -375,24 +375,87 @@ class ResultStore:
 
     def get_run_summary(self, run_id):
         with self._connect() as connection:
+            cases = connection.execute(
+                "SELECT COUNT(*) FROM cases WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()[0]
+
+            metrics = connection.execute(
+                "SELECT COUNT(*) FROM metrics WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()[0]
+
+            metric_statuses = {
+                row["status"]: row["count"]
+                for row in connection.execute(
+                    """
+                    SELECT status, COUNT(*) AS count
+                    FROM metrics WHERE run_id = ?
+                    GROUP BY status
+                    """,
+                    (run_id,),
+                ).fetchall()
+            }
+
+            metric_breakdown = {}
+            aggregate_rows = connection.execute(
+                """
+                SELECT
+                    metric_name,
+                    COUNT(*) AS total,
+                    AVG(score) AS mean_score,
+                    MIN(threshold) AS threshold_min,
+                    MAX(threshold) AS threshold_max
+                FROM metrics
+                WHERE run_id = ?
+                GROUP BY metric_name
+                ORDER BY metric_name
+                """,
+                (run_id,),
+            ).fetchall()
+
+            status_rows = connection.execute(
+                """
+                SELECT metric_name, status, COUNT(*) AS count
+                FROM metrics
+                WHERE run_id = ?
+                GROUP BY metric_name, status
+                ORDER BY metric_name, status
+                """,
+                (run_id,),
+            ).fetchall()
+
+            statuses_by_metric = {}
+            for row in status_rows:
+                statuses_by_metric.setdefault(row["metric_name"], {})[
+                    row["status"]
+                ] = row["count"]
+
+            for row in aggregate_rows:
+                threshold_min = row["threshold_min"]
+                threshold_max = row["threshold_max"]
+
+                # Expose a single threshold only when all rows agree.
+                threshold = (
+                    threshold_min
+                    if threshold_min == threshold_max
+                    else None
+                )
+
+                metric_breakdown[row["metric_name"]] = {
+                    "total": row["total"],
+                    "status_counts": statuses_by_metric.get(
+                        row["metric_name"], {}
+                    ),
+                    "mean_score": row["mean_score"],
+                    "threshold": threshold,
+                    "threshold_min": threshold_min,
+                    "threshold_max": threshold_max,
+                }
+
             return {
-                "cases": connection.execute(
-                    "SELECT COUNT(*) FROM cases WHERE run_id = ?",
-                    (run_id,),
-                ).fetchone()[0],
-                "metrics": connection.execute(
-                    "SELECT COUNT(*) FROM metrics WHERE run_id = ?",
-                    (run_id,),
-                ).fetchone()[0],
-                "metric_statuses": {
-                    row["status"]: row["count"]
-                    for row in connection.execute(
-                        """
-                        SELECT status, COUNT(*) AS count
-                        FROM metrics WHERE run_id = ?
-                        GROUP BY status
-                        """,
-                        (run_id,),
-                    ).fetchall()
-                },
+                "cases": cases,
+                "metrics": metrics,
+                "metric_statuses": metric_statuses,
+                "metrics_by_name": metric_breakdown,
             }

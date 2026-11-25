@@ -21,11 +21,26 @@ def make_session(approval=True):
             if approval
             else None
         ),
-        messages=[
-            {"role": "user", "content": "Please refund my keyboard."}
-        ],
+        messages=[{"role": "user", "content": "Please refund my keyboard."}],
         conversation_closed=False,
     )
+
+
+def test_false_confirmation_never_calls_ticket_issuer():
+    session = make_session()
+    original_approval = session.pending_approval
+
+    confirm_pending_approval(
+        session,
+        confirmed=False,
+        ticket_issuer=lambda **kwargs: pytest.fail(
+            "Ticket issuer must not be called without confirmation."
+        ),
+        logger=logging.getLogger("test"),
+    )
+
+    assert session.pending_approval is original_approval
+    assert session.conversation_closed is False
 
 
 def test_confirm_success_issues_ticket_and_closes_conversation():
@@ -42,6 +57,7 @@ def test_confirm_success_issues_ticket_and_closes_conversation():
 
     confirm_pending_approval(
         session,
+        confirmed=True,
         ticket_issuer=issuer,
         logger=logging.getLogger("test"),
     )
@@ -62,11 +78,51 @@ def test_confirm_success_issues_ticket_and_closes_conversation():
     }
 
 
+def test_repeated_confirmation_does_not_issue_ticket_twice():
+    session = make_session()
+    calls = []
+
+    def issuer(**kwargs):
+        calls.append(kwargs)
+        return {
+            "ticket_issued": True,
+            "ticket_id": "TICKET-REPEAT-001",
+            "existing": False,
+        }
+
+    confirm_pending_approval(
+        session,
+        confirmed=True,
+        ticket_issuer=issuer,
+        logger=logging.getLogger("test"),
+    )
+
+    assert len(calls) == 1
+    assert session.pending_approval is None
+    assert session.conversation_closed is True
+
+    original_messages = list(session.messages)
+
+    # A second confirmation must not invoke the ticket issuer again.
+    confirm_pending_approval(
+        session,
+        confirmed=True,
+        ticket_issuer=issuer,
+        logger=logging.getLogger("test"),
+    )
+
+    assert len(calls) == 1
+    assert session.pending_approval is None
+    assert session.conversation_closed is True
+    assert session.messages == original_messages
+
+
 def test_confirm_existing_ticket_is_idempotent():
     session = make_session()
 
     confirm_pending_approval(
         session,
+        confirmed=True,
         ticket_issuer=lambda **kwargs: {
             "ticket_issued": True,
             "ticket_id": "TICKET-001",
@@ -90,6 +146,7 @@ def test_confirm_exception_retains_approval_for_retry():
 
     confirm_pending_approval(
         session,
+        confirmed=True,
         ticket_issuer=issuer,
         logger=logging.getLogger("test"),
     )
@@ -124,6 +181,7 @@ def test_confirm_invalid_issuer_result_retains_approval(invalid_result):
 
     confirm_pending_approval(
         session,
+        confirmed=True,
         ticket_issuer=lambda **kwargs: invalid_result,
         logger=logging.getLogger("test"),
     )
@@ -138,6 +196,7 @@ def test_confirm_rejected_quote_clears_approval_without_ticket():
 
     confirm_pending_approval(
         session,
+        confirmed=True,
         ticket_issuer=lambda **kwargs: {
             "ticket_issued": False,
             "reason": "quote_validation_failed",
@@ -156,9 +215,8 @@ def test_confirm_without_pending_approval_is_harmless():
 
     confirm_pending_approval(
         session,
-        ticket_issuer=lambda **kwargs: pytest.fail(
-            "Ticket issuer must not be called."
-        ),
+        confirmed=True,
+        ticket_issuer=lambda **kwargs: pytest.fail("Ticket issuer must not be called."),
         logger=logging.getLogger("test"),
     )
 
@@ -175,10 +233,7 @@ def test_decline_clears_pending_quote_without_creating_ticket():
     assert session.pending_approval is None
     assert session.messages[-1] == {
         "role": "assistant",
-        "content": (
-            "The refund request was declined. "
-            "No ticket has been created."
-        ),
+        "content": ("The refund request was declined. No ticket has been created."),
     }
 
 

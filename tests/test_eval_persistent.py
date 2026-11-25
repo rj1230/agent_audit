@@ -146,7 +146,7 @@ def test_trace_finalization_failure_preserves_completed_agent_output(monkeypatch
     monkeypatch.setattr(
         runner,
         "invoke_agent_for_golden",
-        lambda agent, yielded, *, capture_trace=False: (
+        lambda agent, yielded, *, capture_trace=False, defer_trace_capture=False: (
             (
                 {
                     "structured_response": SimpleNamespace(answer="saved answer")
@@ -215,7 +215,7 @@ def test_trace_finalization_failure_marks_pending_metrics_skipped_on_quota():
 
     try:
         runner.EvaluationDataset = QuotaDataset
-        runner.invoke_agent_for_golden = lambda agent, yielded, *, capture_trace=False: (
+        runner.invoke_agent_for_golden = lambda agent, yielded, *, capture_trace=False, defer_trace_capture=False: (
             (
                 {
                     "structured_response": SimpleNamespace(answer="saved answer")
@@ -248,6 +248,98 @@ def test_trace_finalization_failure_marks_pending_metrics_skipped_on_quota():
     assert runner.QUOTA_BLOCKED_MARKER in store.metric_saves[0][1]["error"]
 
 
+
+
+def test_trace_artifact_is_captured_only_after_iterator_finalization(monkeypatch):
+    finalized = {"value": False}
+    store = FakeStore()
+
+    metric = SimpleNamespace(name="Trace Metric", threshold=0.5)
+    metric_data = SimpleNamespace(
+        name="Trace Metric",
+        score=1.0,
+        success=True,
+        threshold=0.5,
+        reason="Expected trace behavior.",
+        error=None,
+    )
+    result = SimpleNamespace(
+        test_results=[
+            SimpleNamespace(metrics_data=[metric_data])
+        ]
+    )
+
+    class SuccessfulFinalizingIterator:
+        def __init__(self):
+            self.calls = 0
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.calls += 1
+            if self.calls == 1:
+                return SimpleNamespace(input="test input")
+
+            finalized["value"] = True
+            raise StopIteration(result)
+
+        def close(self):
+            self.closed = True
+
+    iterator = SuccessfulFinalizingIterator()
+
+    class SuccessfulDataset:
+        def __init__(self, goldens):
+            pass
+
+        def evals_iterator(self, **kwargs):
+            return iterator
+
+    response = {
+        "structured_response": SimpleNamespace(answer="saved answer")
+    }
+
+    def fake_invoke(agent, yielded, *, capture_trace=False,
+                    defer_trace_capture=False):
+        assert capture_trace is True
+        assert defer_trace_capture is True
+        return response, ["lookup_tool"], "trace-uuid-123", None
+
+    def fake_capture(trace_uuid):
+        assert trace_uuid == "trace-uuid-123"
+        assert finalized["value"] is True, (
+            "Trace capture happened before iterator finalization."
+        )
+        return {"root": {"name": "agent", "children": []}}, None
+
+    monkeypatch.setattr(runner, "EvaluationDataset", SuccessfulDataset)
+    monkeypatch.setattr(runner, "invoke_agent_for_golden", fake_invoke)
+    monkeypatch.setattr(runner, "capture_trace_artifact", fake_capture)
+
+    golden = SimpleNamespace(
+        input="test input",
+        expected_output="expected answer",
+    )
+
+    answer, tools_called = runner.evaluate_trace_case(
+        golden=golden,
+        agent=object(),
+        metrics=[metric],
+        store=store,
+        run_id="test-run",
+        case_id="case-success",
+        case_number=1,
+    )
+
+    assert answer == "saved answer"
+    assert tools_called == ["lookup_tool"]
+    assert finalized["value"] is True
+    assert iterator.closed is True
+    assert ("test-run", "case-success") in store.trace_artifacts
+    assert store.metric_saves[0][1]["status"] == "PASS"
+    assert store.case_saves[0]["invocation_status"] == "COMPLETED"
 
 def test_saved_trace_metric_grades_without_agent_invocation(monkeypatch):
     store = FakeStore()
@@ -360,9 +452,14 @@ def _prepare_main_resume_test(
             [runner.golden_payload(golden)]
         ),
         config_fingerprint=runner.fingerprint(
-            runner.metric_config([metric])
+            runner.metric_config(
+                [metric, runner.DeterministicUnsupportedActionClaimsMetric()]
+            )
         ),
-        metadata={"case_numbers": [1], "metrics": ["Trace Metric"]},
+        metadata={
+            "case_numbers": [1],
+            "metrics": ["Trace Metric", "Unsupported Action Claims"],
+        },
     )
     store.save_case(
         run_id,
@@ -406,7 +503,7 @@ def _prepare_main_resume_test(
         "build_metrics",
         lambda: ([metric], []),
     )
-    monkeypatch.setattr(runner, "load_dotenv", lambda: None)
+    monkeypatch.setattr(runner, "load_dotenv", lambda *args, **kwargs: None)
     monkeypatch.setattr(runner, "ensure_judge_available", lambda: None)
 
     agent_package = ModuleType("agent")

@@ -26,7 +26,12 @@ class RefundRulesTests(unittest.TestCase):
                 "future_item": {"price": "5.00", "date": "2026-11-01"},
                 "decimal_a": {"price": "0.10", "date": "2026-10-10"},
                 "decimal_b": {"price": "0.20", "date": "2026-10-10"},
-                "bad_date": {"price": "4.00", "date": "invalid"},
+                "bad_date": {"price": "4.00", "date": "invalid"},
+                "bad_price": {"price": "not-a-price", "date": "2026-10-10"},
+                "nan_price": {"price": "NaN", "date": "2026-10-10"},
+                "infinite_price": {"price": "Infinity", "date": "2026-10-10"},
+                "negative_price": {"price": "-10.00", "date": "2026-10-10"},
+                "oversized_price": {"price": "1e100", "date": "2026-10-10"},
             }
         }
 
@@ -107,5 +112,30 @@ class RefundRulesTests(unittest.TestCase):
         self.assertEqual(result["refund_amount"], "0.30")
 
 
+
+    def test_rejects_malformed_purchase_price(self):
+        result = tools.validate_refund("user123", [self.item("bad_price")])
+        self.assertFalse(result["eligible"])
+        self.assertIn("Invalid purchase price", result["reason"])
+
+    def test_rejects_nan_purchase_price(self):
+        result = tools.validate_refund("user123", [self.item("nan_price")])
+        self.assertFalse(result["eligible"])
+        self.assertIn("Invalid purchase price", result["reason"])
+
+    def test_rejects_infinite_purchase_price(self):
+        result = tools.validate_refund("user123", [self.item("infinite_price")])
+        self.assertFalse(result["eligible"])
+        self.assertIn("Invalid purchase price", result["reason"])
+
+    def test_rejects_negative_purchase_price(self):
+        result = tools.validate_refund("user123", [self.item("negative_price")])
+        self.assertFalse(result["eligible"])
+        self.assertIn("Invalid purchase price", result["reason"])
+
+    def test_rejects_oversized_refund_amount(self):
+        result = tools.validate_refund("user123", [self.item("oversized_price")])
+        self.assertFalse(result["eligible"])
+        self.assertEqual(result["reason"], "Invalid refund amount")
 if __name__ == "__main__":
     unittest.main()

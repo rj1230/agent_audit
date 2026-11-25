@@ -75,3 +75,392 @@ def test_project_metric_routes_extraction_and_scoring_prompts():
     assert "invalid_username" in extraction
     assert "Stop after invalid username." in scoring
     assert "conditional correctness" in scoring.lower()
+
+def _make_plan_quality_case(trace, task=""):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        input=task,
+        _trace_dict=trace,
+    )
+
+
+def test_execution_evidence_extracts_verified_purchase_and_proposal():
+    import json
+
+    case = _make_plan_quality_case({
+        "input": {
+            "messages": [
+                {"role": "user", "content": "Refund the book for user123."}
+            ]
+        },
+        "output": {
+            "lookup_status": "verified",
+            "verified_username": "user123",
+            "purchase_history": {
+                "book": {"date": "2026-10-05", "price": 23},
+                "water_bottle": {"date": "2026-10-06", "price": 15},
+            },
+            "structured_response": {
+                "answer": "A refund proposal is ready.",
+                "refund_proposal": {
+                    "username": "user123",
+                    "items": [{"name": "book"}],
+                },
+            },
+        },
+    })
+
+    evidence = ProjectPlanQualityMetric._build_execution_evidence(case)
+    parsed = json.loads(evidence)
+
+    assert parsed["lookup_status"] == "verified"
+    assert parsed["verified_username"] == "user123"
+    assert parsed["verified_purchase_item_names"] == [
+        "book",
+        "water_bottle",
+    ]
+    assert parsed["refund_proposal_present"] is True
+    assert parsed["final_answer"] == "A refund proposal is ready."
+
+
+def test_execution_evidence_handles_invalid_username_without_proposal():
+    import json
+
+    case = _make_plan_quality_case({
+        "output": {
+            "lookup_status": "invalid_username",
+            "verified_username": None,
+            "purchase_history": {},
+            "structured_response": {
+                "answer": "Please verify your username.",
+                "refund_proposal": None,
+            },
+        },
+    })
+
+    evidence = ProjectPlanQualityMetric._build_execution_evidence(case)
+    parsed = json.loads(evidence)
+
+    assert parsed["lookup_status"] == "invalid_username"
+    assert parsed["verified_username"] is None
+    assert parsed["verified_purchase_item_names"] == []
+    assert parsed["refund_proposal_present"] is False
+    assert parsed["final_answer"] == "Please verify your username."
+
+
+def test_execution_evidence_handles_missing_structured_response():
+    import json
+
+    case = _make_plan_quality_case({
+        "output": {
+            "lookup_status": "verified",
+            "verified_username": "user123",
+            "purchase_history": {"book": {"price": 23}},
+        },
+    })
+
+    evidence = ProjectPlanQualityMetric._build_execution_evidence(case)
+    parsed = json.loads(evidence)
+
+    assert parsed["lookup_status"] == "verified"
+    assert parsed["verified_purchase_item_names"] == ["book"]
+    assert parsed["refund_proposal_present"] is False
+    assert parsed["final_answer"] == ""
+
+
+def test_execution_evidence_returns_none_for_missing_or_malformed_output():
+    assert ProjectPlanQualityMetric._build_execution_evidence(
+        _make_plan_quality_case(None)
+    ) is None
+
+    assert ProjectPlanQualityMetric._build_execution_evidence(
+        _make_plan_quality_case({"output": None})
+    ) is None
+
+    assert ProjectPlanQualityMetric._build_execution_evidence(
+        _make_plan_quality_case({"output": "not-a-dictionary"})
+    ) is None
+
+
+def test_original_task_prefers_nonempty_test_case_input():
+    case = _make_plan_quality_case(
+        {
+            "input": {
+                "messages": [
+                    {"role": "user", "content": "Trace task"}
+                ]
+            }
+        },
+        task="Canonical test-case task",
+    )
+
+    assert ProjectPlanQualityMetric._get_original_task(case) == (
+        "Canonical test-case task"
+    )
+
+
+def test_original_task_falls_back_to_latest_user_message():
+    case = _make_plan_quality_case({
+        "input": {
+            "messages": [
+                {"role": "user", "content": "First user message"},
+                {"role": "assistant", "content": "Assistant response"},
+                {"role": "tool", "content": "Tool output"},
+                {"role": "human", "content": "Latest user message"},
+            ]
+        },
+    })
+
+    assert ProjectPlanQualityMetric._get_original_task(case) == (
+        "Latest user message"
+    )
+
+
+def test_original_task_ignores_non_user_messages_and_malformed_entries():
+    case = _make_plan_quality_case({
+        "input": {
+            "messages": [
+                None,
+                {"role": "assistant", "content": "Assistant response"},
+                {"role": "tool", "content": "Tool output"},
+                {"role": "user", "content": "   "},
+            ]
+        },
+    })
+
+    assert ProjectPlanQualityMetric._get_original_task(case) == ""
+
+
+def test_async_original_task_uses_same_deterministic_fallback():
+    import asyncio
+
+    case = _make_plan_quality_case({
+        "input": {
+            "messages": [
+                {"role": "user", "content": "Original request"},
+                {"role": "assistant", "content": "Response"},
+                {"role": "user", "content": "Latest request"},
+            ]
+        },
+    })
+
+    metric = object.__new__(ProjectPlanQualityMetric)
+    result = asyncio.run(
+        metric._a_extract_task_from_trace(case)
+    )
+
+    assert result == "Latest request"
+
+
+def test_execution_evidence_validates_the_saved_book_and_pen_proposal():
+    import json
+
+    case = _make_plan_quality_case({
+        "input": {
+            "messages": [{
+                "role": "user",
+                "content": "I am user123, I would like a refund for the book and the pen",
+            }]
+        },
+        "output": {
+            "lookup_status": "verified",
+            "verified_username": "user123",
+            "purchase_history": {
+                "book": {"date": "2026-10-05", "price": 23},
+                "pen": {"date": "2026-10-03", "price": 7},
+            },
+            "structured_response": {
+                "answer": "A proposal is ready.",
+                "refund_proposal": {
+                    "username": "user123",
+                    "items": [{"name": "book"}, {"name": "pen"}],
+                },
+            },
+        },
+    })
+
+    parsed = json.loads(ProjectPlanQualityMetric._build_execution_evidence(case))
+    assert parsed["proposal_validation_status"] == "PASS"
+    assert parsed["proposal_validation_errors"] == []
+    assert parsed["requested_verified_refund_item_names"] == ["book", "pen"]
+
+
+def test_execution_evidence_accepts_valid_subset_of_requested_items():
+    import json
+
+    case = _make_plan_quality_case({
+        "input": {"messages": [{
+            "role": "user",
+            "content": "I want a refund for the book and pen",
+        }]},
+        "output": {
+            "lookup_status": "verified",
+            "verified_username": "user123",
+            "purchase_history": {
+                "book": {"price": 23},
+                "pen": {"price": 7},
+            },
+            "structured_response": {
+                "refund_proposal": {
+                    "username": "user123",
+                    "items": [{"name": "book"}],
+                },
+            },
+        },
+    })
+
+    parsed = json.loads(ProjectPlanQualityMetric._build_execution_evidence(case))
+    assert parsed["proposal_validation_status"] == "PASS"
+    assert parsed["proposal_validation_errors"] == []
+    assert parsed["requested_verified_refund_item_names"] == ["book", "pen"]
+
+
+def test_execution_evidence_fails_for_wrong_username_and_unrequested_item():
+    import json
+
+    case = _make_plan_quality_case({
+        "input": {"messages": [{
+            "role": "user",
+            "content": "I want a refund for the book for user123",
+        }]},
+        "output": {
+            "lookup_status": "verified",
+            "verified_username": "user123",
+            "purchase_history": {
+                "book": {"price": 23},
+                "pen": {"price": 7},
+            },
+            "structured_response": {
+                "refund_proposal": {
+                    "username": "user999",
+                    "items": [{"name": "book"}, {"name": "pen"}],
+                },
+            },
+        },
+    })
+
+    parsed = json.loads(ProjectPlanQualityMetric._build_execution_evidence(case))
+    assert parsed["proposal_validation_status"] == "FAIL"
+    assert any("username" in error for error in parsed["proposal_validation_errors"])
+    assert any("not affirmatively requested" in error for error in parsed["proposal_validation_errors"])
+
+
+def test_execution_evidence_marks_information_only_branch_not_applicable():
+    import json
+
+    case = _make_plan_quality_case({
+        "input": {"messages": [{
+            "role": "user",
+            "content": "Show me my book purchase history for user123",
+        }]},
+        "output": {
+            "lookup_status": "verified",
+            "verified_username": "user123",
+            "purchase_history": {"book": {"price": 23}},
+            "structured_response": {
+                "answer": "You purchased a book.",
+                "refund_proposal": None,
+            },
+        },
+    })
+
+    parsed = json.loads(ProjectPlanQualityMetric._build_execution_evidence(case))
+    assert parsed["proposal_validation_status"] == "NOT_APPLICABLE"
+    assert parsed["proposal_validation_errors"] == []
+
+
+def test_execution_evidence_rejects_duplicate_proposal_items():
+    import json
+
+    case = _make_plan_quality_case({
+        "input": {"messages": [{
+            "role": "user",
+            "content": "Refund the book for user123",
+        }]},
+        "output": {
+            "lookup_status": "verified",
+            "verified_username": "user123",
+            "purchase_history": {"book": {"price": 23}},
+            "structured_response": {
+                "refund_proposal": {
+                    "username": "user123",
+                    "items": [{"name": "book"}, {"name": "the book"}],
+                },
+            },
+        },
+    })
+
+    parsed = json.loads(ProjectPlanQualityMetric._build_execution_evidence(case))
+    assert parsed["proposal_validation_status"] == "FAIL"
+    assert any("Duplicate" in error for error in parsed["proposal_validation_errors"])
+
+
+def test_execution_evidence_uses_affirmative_intent_across_multiple_turns():
+    import json
+
+    case = _make_plan_quality_case({
+        "input": {"messages": [
+            {"role": "user", "content": "I am user123."},
+            {"role": "assistant", "content": "How can I help?"},
+            {"role": "user", "content": "I would like a refund for the book."},
+        ]},
+        "output": {
+            "lookup_status": "verified",
+            "verified_username": "user123",
+            "purchase_history": {"book": {"price": 23}},
+            "structured_response": {
+                "refund_proposal": {
+                    "username": "user123",
+                    "items": [{"name": "book"}],
+                },
+            },
+        },
+    })
+
+    parsed = json.loads(ProjectPlanQualityMetric._build_execution_evidence(case))
+    assert parsed["proposal_validation_status"] == "PASS"
+    assert parsed["requested_verified_refund_item_names"] == ["book"]
+
+
+def test_execution_evidence_rejects_conflicting_intent_across_multiple_turns():
+    import json
+
+    case = _make_plan_quality_case({
+        "input": {"messages": [
+            {"role": "user", "content": "I want a refund for the book."},
+            {"role": "assistant", "content": "Understood."},
+            {"role": "user", "content": "Actually, do not refund the book."},
+        ]},
+        "output": {
+            "lookup_status": "verified",
+            "verified_username": "user123",
+            "purchase_history": {"book": {"price": 23}},
+            "structured_response": {"refund_proposal": None},
+        },
+    })
+
+    parsed = json.loads(ProjectPlanQualityMetric._build_execution_evidence(case))
+    assert parsed["proposal_validation_status"] == "NOT_APPLICABLE"
+    assert parsed["requested_verified_refund_item_names"] == []
+
+
+def test_execution_evidence_ignores_questions_across_multiple_turns():
+    import json
+
+    case = _make_plan_quality_case({
+        "input": {"messages": [
+            {"role": "user", "content": "Can I get a refund for the book?"},
+            {"role": "assistant", "content": "I can explain the policy."},
+        ]},
+        "output": {
+            "lookup_status": "verified",
+            "verified_username": "user123",
+            "purchase_history": {"book": {"price": 23}},
+            "structured_response": {"refund_proposal": None},
+        },
+    })
+
+    parsed = json.loads(ProjectPlanQualityMetric._build_execution_evidence(case))
+    assert parsed["proposal_validation_status"] == "NOT_APPLICABLE"
+    assert parsed["requested_verified_refund_item_names"] == []

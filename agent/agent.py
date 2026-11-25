@@ -1,18 +1,17 @@
 import logging
 from time import perf_counter
 from uuid import uuid4
+from types import SimpleNamespace
 
 from dotenv import load_dotenv
-from langchain.agents import create_agent
-from langchain.agents.structured_output import ToolStrategy
 from langchain.messages import HumanMessage
-from agent.checkpoint_store import checkpointer
+from agent.two_stage import agent
+from agent.approval import (
+    confirm_pending_approval,
+    decline_pending_approval,
+)
 
-from agent.models import model
-from agent.agent_context import AgentContext
-from agent.tools import get_user_purchase_history
-from agent.prompts import agent_system_prompt
-from agent.objects import Answer, PurchaseItem
+from agent.objects import Answer
 from agent.execution import _proposal_to_approval
 from agent.tools import issue_approved_refund_ticket
 from agent.tracing import ToolTraceCallback, write_agent_trace
@@ -30,16 +29,6 @@ logger = logging.getLogger(__name__)
 MAX_CONVERSATION_TURNS = 8
 
 
-agent = create_agent(
-    model=model,
-    system_prompt=agent_system_prompt,
-    tools=[
-        get_user_purchase_history,
-    ],
-    response_format=ToolStrategy(Answer),
-    context_schema=AgentContext,
-    checkpointer=checkpointer,
-)
 
 
 def run_conversation(initial_message=None):
@@ -133,6 +122,8 @@ def run_conversation(initial_message=None):
             print("\nSupport Agent:")
             print(structured_response.answer)
 
+        cli_state = None
+
         if proposal is not None:
             try:
                 approval, validation_error = _proposal_to_approval(
@@ -170,36 +161,49 @@ def run_conversation(initial_message=None):
                         "\nConfirm this exact refund quote? (y/N): "
                     ).strip().lower()
 
-                    if confirmation == "y":
-                        ticket_result = issue_approved_refund_ticket(
-                            request_id=approval["request_id"],
-                            user=approval["user"],
-                            items=[
-                                PurchaseItem(name=item["name"])
-                                for item in approval["items"]
-                            ],
-                            approved_quote=quote,
-                        )
+                    cli_state = SimpleNamespace(
+                        pending_approval=approval,
+                        messages=[],
+                        conversation_closed=False,
+                    )
 
-                        if ticket_result.get("ticket_issued"):
-                            print(
-                                "\nSimulated refund ticket recorded: "
-                                f"{ticket_result['ticket_id']}"
+                    if confirmation == "y":
+                        while cli_state.pending_approval is not None:
+                            previous_message_count = len(cli_state.messages)
+
+                            confirm_pending_approval(
+                                cli_state,
+                                confirmed=True,
+                                ticket_issuer=issue_approved_refund_ticket,
+                                logger=logger,
                             )
-                            if ticket_result.get("existing"):
-                                print(
-                                    "This is the previously recorded ticket "
-                                    "for the same request."
+
+                            if len(cli_state.messages) > previous_message_count:
+                                message = cli_state.messages[-1]["content"].replace(
+                                    "No money has been transferred.",
+                                    "No money was transferred.",
                                 )
-                            print("No money was transferred.")
-                        else:
-                            print(
-                                "\nNo ticket was created: "
-                                f"{ticket_result.get('reason', 'validation_failed')}"
-                            )
+                                print("\n" + message)
+
+                            if cli_state.pending_approval is None:
+                                break
+
+                            retry = input(
+                                "\\nThe ticket outcome is unresolved. "
+                                "Retry the same request and quote? (y/N): "
+                            ).strip().lower()
+
+                            if retry != "y":
+                                print(
+                                    "\\nApproval remains unresolved. "
+                                    "Ending this CLI session without "
+                                    "starting another request."
+                                )
+                                return
                     else:
+                        decline_pending_approval(cli_state)
                         print(
-                            "\nRefund quote declined. No ticket was created."
+                            "\\nRefund quote declined. No ticket was created."
                         )
 
             except Exception:
@@ -212,6 +216,10 @@ def run_conversation(initial_message=None):
                     "\nI couldn't complete the approval step. "
                     "No new ticket should be assumed."
                 )
+
+        if cli_state is not None and cli_state.conversation_closed:
+            print("\nConversation completed.")
+            return
 
         if not structured_response.conversation:
             print("\nConversation completed.")

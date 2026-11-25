@@ -47,6 +47,7 @@ def test_confirmation_records_metadata_only(
 
     approval.confirm_pending_approval(
         session,
+        confirmed=True,
         ticket_issuer=lambda **kwargs: issuer_result,
         logger=logging.getLogger("approval-test"),
     )
@@ -83,6 +84,7 @@ def test_confirmation_exception_records_failure_and_retains_approval(
 
     approval.confirm_pending_approval(
         session,
+        confirmed=True,
         ticket_issuer=failing_issuer,
         logger=logging.getLogger("approval-test"),
     )
@@ -115,6 +117,7 @@ def test_audit_write_failure_does_not_break_successful_confirmation(monkeypatch)
 
     approval.confirm_pending_approval(
         session,
+        confirmed=True,
         ticket_issuer=lambda **kwargs: {
             "ticket_issued": True,
             "ticket_id": "PRIVATE-TICKET",

@@ -413,5 +413,67 @@ print(json.dumps(result))
         self.assertEqual(count, 1)
 
 
+    def test_failed_insert_rolls_back_without_partial_ticket(self):
+        # Create the table before installing the failure-injection trigger.
+        create_or_get_ticket(
+            "request-seed",
+            "user123",
+            self.items,
+            "30.00",
+            self.db_path,
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                """
+                CREATE TRIGGER reject_test_ticket_insert
+                BEFORE INSERT ON refund_tickets
+                BEGIN
+                    SELECT RAISE(ABORT, 'simulated database failure');
+                END
+                """
+            )
+            connection.commit()
+
+        # The simulated database failure must propagate.
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError,
+            "simulated database failure",
+        ):
+            create_or_get_ticket(
+                "request-failed-insert",
+                "user123",
+                self.items,
+                "30.00",
+                self.db_path,
+            )
+
+        # The failed transaction must not leave a ticket behind.
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            count = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM refund_tickets
+                WHERE request_id = ?
+                """,
+                ("request-failed-insert",),
+            ).fetchone()[0]
+
+        self.assertEqual(count, 0)
+
+        # The previously committed ticket must remain intact.
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            seed_count = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM refund_tickets
+                WHERE request_id = ?
+                """,
+                ("request-seed",),
+            ).fetchone()[0]
+
+        self.assertEqual(seed_count, 1)
+
 if __name__ == "__main__":
     unittest.main()
+

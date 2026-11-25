@@ -191,3 +191,82 @@ def test_sqlite_tool_calls_restore_as_deepeval_objects(store):
     assert isinstance(restored[0], ToolCall)
     assert restored[0].name == "lookup_tool"
     assert restored[0].input_parameters == {"order_id": "123"}
+
+def test_summary_includes_per_metric_breakdown(store):
+    for case_number in range(1, 4):
+        store.save_case(
+            "test-run",
+            f"case-{case_number:03d}",
+            case_number,
+            "input",
+            "expected",
+            invocation_status="COMPLETED",
+        )
+
+    store.save_metric(
+        "test-run", "case-001", "Unsupported Action Claims",
+        "PASS", score=1.0, threshold=1.0,
+    )
+    store.save_metric(
+        "test-run", "case-002", "Unsupported Action Claims",
+        "FAIL", score=0.2, threshold=1.0,
+    )
+    store.save_metric(
+        "test-run", "case-003", "Unsupported Action Claims",
+        "EVALUATION_ERROR", score=None, threshold=1.0,
+        error="evaluation unavailable",
+    )
+
+    summary = store.get_run_summary("test-run")
+    details = summary["metrics_by_name"]["Unsupported Action Claims"]
+
+    # Existing summary fields remain available and unchanged.
+    assert summary["cases"] == 3
+    assert summary["metrics"] == 3
+    assert summary["metric_statuses"] == {
+        "PASS": 1,
+        "FAIL": 1,
+        "EVALUATION_ERROR": 1,
+    }
+
+    assert details["total"] == 3
+    assert details["status_counts"] == {
+        "PASS": 1,
+        "FAIL": 1,
+        "EVALUATION_ERROR": 1,
+    }
+    assert details["mean_score"] == pytest.approx(0.6)
+    assert details["threshold"] == 1.0
+    assert details["threshold_min"] == 1.0
+    assert details["threshold_max"] == 1.0
+
+
+def test_summary_handles_empty_metrics(store):
+    summary = store.get_run_summary("test-run")
+
+    assert summary["cases"] == 0
+    assert summary["metrics"] == 0
+    assert summary["metric_statuses"] == {}
+    assert summary["metrics_by_name"] == {}
+
+
+def test_summary_reports_inconsistent_threshold_range(store):
+    for case_number, threshold in ((1, 0.8), (2, 1.0)):
+        case_id = f"case-{case_number:03d}"
+        store.save_case(
+            "test-run", case_id, case_number,
+            "input", "expected",
+            invocation_status="COMPLETED",
+        )
+        store.save_metric(
+            "test-run", case_id, "Metric With Changed Threshold",
+            "PASS", score=1.0, threshold=threshold,
+        )
+
+    details = store.get_run_summary("test-run")[
+        "metrics_by_name"
+    ]["Metric With Changed Threshold"]
+
+    assert details["threshold"] is None
+    assert details["threshold_min"] == 0.8
+    assert details["threshold_max"] == 1.0

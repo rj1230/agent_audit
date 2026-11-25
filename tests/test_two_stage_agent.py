@@ -133,6 +133,51 @@ def test_finalizer_rejects_unrequested_item_and_replaces_claim(
     assert "no ticket was created" in answer.answer.lower()
 
 
+def test_finalizer_preserves_verified_items_when_replacing_success_claim(
+    monkeypatch,
+):
+    parsed = FinalAnswerOutput(
+        answer="Your refund has been approved and your ticket has been created.",
+        conversation=False,
+        refund_proposal=StrictRefundProposal(
+            username="user123",
+            items=[StrictPurchaseItem(name="book")],
+        ),
+    )
+
+    finalizer_mock = Mock()
+    finalizer_mock.invoke.return_value = {
+        "raw": AIMessage(content="{}"),
+        "parsed": parsed,
+        "parsing_error": None,
+    }
+    monkeypatch.setattr(two_stage, "finalizer", finalizer_mock)
+
+    state = {
+        "messages": [
+            HumanMessage(
+                content="I'm user123 and I want a refund for my book."
+            ),
+        ],
+        "lookup_status": "verified",
+        "verified_username": "user123",
+        "purchase_history": {
+            "book": {"date": "2026-10-05", "price": 23},
+        },
+    }
+
+    result = two_stage._finalizer_node(state, config={})
+    answer = result["structured_response"]
+
+    assert answer.refund_proposal is not None
+    assert answer.refund_proposal.username == "user123"
+    assert [item.name for item in answer.refund_proposal.items] == ["book"]
+    assert "refund proposal for book" in answer.answer.lower()
+    assert "not been submitted or approved" in answer.answer.lower()
+    assert "explicit confirmation" in answer.answer.lower()
+    assert "ticket has been created" not in answer.answer.lower()
+    assert not two_stage._contains_unsupported_success_claim(answer.answer)
+
 def test_finalizer_replaces_success_claim_without_proposal(monkeypatch):
     finalizer_mock = Mock()
     finalizer_mock.invoke.return_value = make_finalizer_result(
@@ -173,6 +218,7 @@ def test_finalizer_replaces_success_claim_without_proposal(monkeypatch):
         "Your request will be forwarded after you confirm.",
         "Your refund request will be submitted once you approve.",
         "Your refund request has not been submitted.",
+        "Your refund for the book has not been submitted.",
         "I have not forwarded your request.",
     ],
 )
@@ -192,6 +238,8 @@ def test_success_claim_guard_preserves_negations_and_normal_answers(answer):
         "The refund request was submitted.",
         "Your refund request has been submitted.",
         "Your refund request for water_bottle has been submitted for review.",
+        "Your refund for the book and pen has been forwarded for review.",
+        "Your refund for the book has been submitted.",
         "Your request will now be forwarded for review.",
         "Your request has been forwarded for review.",
         "I have forwarded your request for review.",
@@ -466,7 +514,7 @@ def test_new_turn_clears_previous_verified_identity(monkeypatch):
         trusted_context_message.content
     )
     assert '"verified_username": null' in trusted_context_message.content
-    assert '"verified_purchase_item_names": []' in (
+    assert '"verified_purchase_records": []' in (
         trusted_context_message.content
     )
 
@@ -740,3 +788,267 @@ def test_provider_diagnostics_preserves_stage_and_exception(stage, capsys):
     assert details["stage"] == stage
     assert details["exception_type"] == "RuntimeError"
     assert details["message"] == "synthetic provider failure"
+
+
+def test_finalizer_uses_deterministic_eligibility_for_explicit_question(
+    monkeypatch,
+):
+    parsed_result = make_finalizer_result(
+        answer=(
+            "Both purchases were made before the 30-day refund window "
+            "ended on October 14, so they are ineligible."
+        )
+    )
+
+    monkeypatch.setattr(
+        two_stage,
+        "_invoke_with_provider_diagnostics",
+        lambda *args, **kwargs: parsed_result,
+    )
+
+    validator_calls = []
+
+    def fake_validate_refund(username, items):
+        validator_calls.append((username, items))
+        return {
+            "eligible": False,
+            "reason": (
+                "book was purchased 39 days ago; "
+                "refund window is 30 days"
+            ),
+        }
+
+    monkeypatch.setattr(two_stage, "validate_refund", fake_validate_refund)
+
+    result = two_stage._finalizer_node(
+        {
+            "messages": [
+                HumanMessage(
+                    content="Is my book eligible for a refund?"
+                )
+            ],
+            "lookup_status": "verified",
+            "verified_username": "user123",
+            "purchase_history": {
+                "book": {"date": "2026-10-05", "price": 23},
+                "pen": {"date": "2026-10-03", "price": 7},
+            },
+        },
+        {},
+    )
+
+    answer = result["structured_response"]
+
+    assert len(validator_calls) == 1
+    assert validator_calls[0][0] == "user123"
+    assert validator_calls[0][1][0].name == "book"
+
+    assert "39 days ago" in answer.answer
+    assert "October 14" not in answer.answer
+    assert "$" not in answer.answer
+    assert "₹" not in answer.answer
+    assert "no refund proposal" in answer.answer.lower()
+    assert answer.refund_proposal is None
+
+
+def test_finalizer_does_not_run_eligibility_check_for_purchase_history(
+    monkeypatch,
+):
+    parsed_result = make_finalizer_result(
+        answer="Your verified purchase history includes a book and a pen."
+    )
+
+    monkeypatch.setattr(
+        two_stage,
+        "_invoke_with_provider_diagnostics",
+        lambda *args, **kwargs: parsed_result,
+    )
+
+    validator = Mock()
+    monkeypatch.setattr(two_stage, "validate_refund", validator)
+
+    result = two_stage._finalizer_node(
+        {
+            "messages": [
+                HumanMessage(content="Show me my purchase history.")
+            ],
+            "lookup_status": "verified",
+            "verified_username": "user123",
+            "purchase_history": {
+                "book": {"date": "2026-10-05", "price": 23},
+                "pen": {"date": "2026-10-03", "price": 7},
+            },
+        },
+        {},
+    )
+
+    answer = result["structured_response"]
+
+    validator.assert_not_called()
+    assert answer.answer == parsed_result["parsed"].answer
+    assert answer.refund_proposal is None
+
+
+def test_finalizer_asks_for_exact_item_for_eligibility_question(
+    monkeypatch,
+):
+    parsed_result = make_finalizer_result(
+        answer="Both purchases are outside the refund window."
+    )
+
+    monkeypatch.setattr(
+        two_stage,
+        "_invoke_with_provider_diagnostics",
+        lambda *args, **kwargs: parsed_result,
+    )
+
+    validator = Mock()
+    monkeypatch.setattr(two_stage, "validate_refund", validator)
+
+    result = two_stage._finalizer_node(
+        {
+            "messages": [
+                HumanMessage(
+                    content="Are any of my purchases eligible for a refund?"
+                )
+            ],
+            "lookup_status": "verified",
+            "verified_username": "user123",
+            "purchase_history": {
+                "book": {"date": "2026-10-05", "price": 23},
+                "pen": {"date": "2026-10-03", "price": 7},
+            },
+        },
+        {},
+    )
+
+    answer = result["structured_response"]
+
+    validator.assert_not_called()
+    assert "which exact purchased item" in answer.answer.lower()
+    assert answer.refund_proposal is None
+
+def test_finalizer_provider_exception_returns_safe_fallback(monkeypatch):
+    invocation = Mock(side_effect=RuntimeError("synthetic provider failure"))
+    monkeypatch.setattr(
+        two_stage, "_invoke_with_provider_diagnostics", invocation
+    )
+
+    result = two_stage._finalizer_node(
+        {
+            "messages": [HumanMessage(content="Please refund my book.")],
+            "lookup_status": "not_attempted",
+            "verified_username": None,
+            "purchase_history": None,
+        },
+        {},
+    )
+
+    answer = result["structured_response"]
+    assert isinstance(answer, two_stage.Answer)
+    assert answer.refund_proposal is None
+    assert answer.conversation is True
+    assert "no refund proposal was prepared" in answer.answer.lower()
+    assert "no refund action was taken" in answer.answer.lower()
+    invocation.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "malformed_result",
+    [
+        {
+            "raw": AIMessage(content="plain text instead of JSON"),
+            "parsed": None,
+            "parsing_error": ValueError("synthetic parse failure"),
+        },
+        {"raw": AIMessage(content="{}"), "parsed": None, "parsing_error": None},
+        {"unexpected": "result shape"},
+    ],
+)
+def test_finalizer_malformed_output_returns_safe_fallback(
+    monkeypatch, malformed_result
+):
+    invocation = Mock(return_value=malformed_result)
+    monkeypatch.setattr(
+        two_stage, "_invoke_with_provider_diagnostics", invocation
+    )
+
+    result = two_stage._finalizer_node(
+        {
+            "messages": [HumanMessage(content="Please refund my book.")],
+            "lookup_status": "not_attempted",
+            "verified_username": None,
+            "purchase_history": None,
+        },
+        {},
+    )
+
+    answer = result["structured_response"]
+    assert isinstance(answer, two_stage.Answer)
+    assert answer.refund_proposal is None
+    assert answer.conversation is True
+    assert "no refund proposal was prepared" in answer.answer.lower()
+    assert "no refund action was taken" in answer.answer.lower()
+    invocation.assert_called_once()
+
+
+
+@pytest.mark.parametrize(
+    ("message", "item_name", "expected"),
+    [
+        (
+            "I don't want a refund for the book, but I do want a refund for the pen.",
+            "book",
+            False,
+        ),
+        (
+            "I don't want a refund for the book, but I do want a refund for the pen.",
+            "pen",
+            True,
+        ),
+        (
+            "Please refund the book, but do not refund the pen.",
+            "book",
+            True,
+        ),
+        (
+            "Please refund the book, but do not refund the pen.",
+            "pen",
+            False,
+        ),
+        (
+            "I want a refund for the book, but I changed my mind: "
+            "I do not want a refund for the book.",
+            "book",
+            False,
+        ),
+        (
+            "Please refund the book and pen.",
+            "book",
+            True,
+        ),
+        (
+            "Please refund the book and pen.",
+            "pen",
+            True,
+        ),
+        (
+            "Can I get a refund for the pen?",
+            "pen",
+            False,
+        ),
+    ],
+)
+def test_customer_requested_item_is_item_specific(
+    message,
+    item_name,
+    expected,
+):
+    from langchain_core.messages import HumanMessage
+
+    result = two_stage._customer_requested_item(
+        [HumanMessage(content=message)],
+        item_name,
+    )
+
+    assert result is expected

@@ -13,13 +13,13 @@ from deepeval.test_case import LLMTestCase, ToolCall
 
 try:
     from .dataset import dataset
-    from .eval_all import build_metrics
-    from .evaluation_helpers import invoke_agent_for_golden
+    from .eval_all import build_metrics, deterministic_argument_result
+    from .evaluation_helpers import invoke_agent_for_golden, capture_trace_artifact
     from .result_store import ResultStore, fingerprint
 except ImportError:
     from dataset import dataset
-    from eval_all import build_metrics
-    from evaluation_helpers import invoke_agent_for_golden
+    from eval_all import build_metrics, deterministic_argument_result
+    from evaluation_helpers import invoke_agent_for_golden, capture_trace_artifact
     from result_store import ResultStore, fingerprint
 
 try:
@@ -41,6 +41,102 @@ except ImportError:
 
 
 QUOTA_BLOCKED_MARKER = "[JUDGE_DAILY_QUOTA_BLOCKED]"
+
+
+class DeterministicUnsupportedActionClaimsMetric:
+    """Local check for unsupported claims that a refund action was taken."""
+
+    name = "Unsupported Action Claims"
+    threshold = 1.0
+    deterministic = True
+
+
+def unsupported_action_claim_result(answer, threshold=1.0):
+    """Flag unsupported completed actions or commitments in customer-facing text."""
+    import re
+
+    text = str(answer or "")
+
+    patterns = [
+        re.compile(
+            r"\b(?:refund(?:\s+request)?|request|ticket|case)\b"
+            r"[^.!?\n]{0,100}\b"
+            r"(?:has\s+been|have\s+been|was|were|is|are|"
+            r"will\s+be|will\s+now\s+be|has|have|will)\s+"
+            r"(?:being\s+)?"
+            r"(?:submitted|forwarded|processed|approved|issued|"
+            r"created|opened|sent)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:i|we|our team|the system)\s+"
+            r"(?:(?:have|has|had)\s+)?(?:now\s+)?"
+            r"(?:submitted|forwarded|processed|approved|issued|"
+            r"created|opened|sent)\s+"
+            r"(?:(?:your|a|an|the)\s+)?"
+            r"(?:refund|refund\s+request|request|ticket|case)\b",
+            re.IGNORECASE,
+        ),
+    ]
+
+    negation = re.compile(
+        r"\b(?:not|never|no|cannot|can't|couldn't|didn't|"
+        r"hasn't|haven't|wasn't|weren't|unable\s+to)\b",
+        re.IGNORECASE,
+    )
+    conditional = re.compile(
+        r"\b(?:if|after|once|when)\b[^.!?\n]{0,70}"
+        r"\b(?:confirm|confirmation|provide|approve)\b",
+        re.IGNORECASE,
+    )
+
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            sentence_start = max(
+                text.rfind(".", 0, match.start()),
+                text.rfind("!", 0, match.start()),
+                text.rfind("?", 0, match.start()),
+                text.rfind("\n", 0, match.start()),
+            ) + 1
+
+            sentence_end_candidates = [
+                position for position in (
+                    text.find(".", match.end()),
+                    text.find("!", match.end()),
+                    text.find("?", match.end()),
+                    text.find("\n", match.end()),
+                )
+                if position != -1
+            ]
+            sentence_end = min(sentence_end_candidates) if sentence_end_candidates else len(text)
+
+            prefix = text[sentence_start:match.start()]
+            suffix = text[match.end():sentence_end]
+
+            # Explicit denial or inability to confirm is not a success claim.
+            if negation.search(prefix):
+                continue
+
+            # A clearly conditional future step is not a claim that it happened.
+            if conditional.search(suffix):
+                continue
+
+            return {
+                "status": "FAIL",
+                "score": 0.0,
+                "reason": (
+                    "Unsupported action claim detected in customer-facing "
+                    f"response: {match.group(0).strip()!r}"
+                ),
+            }
+
+    score = 1.0
+    return {
+        "status": "PASS" if score >= threshold else "FAIL",
+        "score": score,
+        "reason": "No unsupported refund-submission, forwarding, processing, approval, or ticket-issuance claim detected.",
+    }
+
 
 
 def metric_lookup_names(metric):
@@ -179,17 +275,14 @@ def evaluate_trace_case(golden, agent, metrics, store, run_id, case_id, case_num
 
     try:
         yielded = next(iterator)
-        response, tools_called, trace_dict, trace_error = (
-            invoke_agent_for_golden(agent, yielded, capture_trace=True)
-        )
-
-        if trace_dict is None:
-            print(f"  TRACE CAPTURE FAILED: {trace_error or 'Unknown capture failure'}")
-        else:
-            print(
-                f"  TRACE CAPTURE SUCCEEDED: "
-                f"{len(trace_dict.get('children', []))} root children"
+        response, tools_called, trace_uuid, trace_error = (
+            invoke_agent_for_golden(
+                agent,
+                yielded,
+                capture_trace=True,
+                defer_trace_capture=True,
             )
+        )
 
         answer = response["structured_response"].answer
 
@@ -202,22 +295,43 @@ def evaluate_trace_case(golden, agent, metrics, store, run_id, case_id, case_num
             actual_output=answer,
             tools_called=tools_called,
             invocation_status="COMPLETED",
-            invocation_error=trace_error,
+            invocation_error=None,
         )
         invocation_completed = True
-
-        if trace_dict is not None:
-            store.save_trace_artifact(run_id, case_id, trace_dict)
-            print("  TRACE ARTIFACT SAVED.")
-        else:
-            print("  WARNING: Agent response saved, but no trace artifact was saved.")
 
         try:
             next(iterator)
         except StopIteration as stop:
             result = stop.value
+        except Exception:
+            # The iterator may have finalized the trace before raising.
+            # Attempt capture after the finalization attempt, then preserve
+            # the original iterator exception for the outer error handler.
+            trace_dict, trace_error = capture_trace_artifact(trace_uuid)
+            if trace_dict is not None:
+                store.save_trace_artifact(run_id, case_id, trace_dict)
+                print("  TRACE ARTIFACT SAVED.")
+            raise
         else:
             raise RuntimeError("Trace iterator yielded unexpected extra cases.")
+
+        # The iterator has resumed past its yield and finalized its observer.
+        trace_dict, trace_error = capture_trace_artifact(trace_uuid)
+        if trace_dict is None:
+            print(
+                f"  TRACE CAPTURE FAILED: "
+                f"{trace_error or 'Unknown capture failure'}"
+            )
+            print(
+                "  WARNING: Agent response saved, but no trace artifact was saved."
+            )
+        else:
+            print(
+                f"  TRACE CAPTURE SUCCEEDED: "
+                f"{len(trace_dict.get('children', []))} root children"
+            )
+            store.save_trace_artifact(run_id, case_id, trace_dict)
+            print("  TRACE ARTIFACT SAVED.")
 
         if result is None:
             raise RuntimeError("DeepEval trace iterator returned no result.")
@@ -393,6 +507,40 @@ def evaluate_saved_trace_metric(
 def evaluate_single_metric(golden, answer, tools_called, metric, store, run_id, case_id):
     """Evaluate one single-turn metric and persist it independently."""
     name = metric_storage_name(metric)
+
+    if getattr(metric, "deterministic", False):
+        if name == "Unsupported Action Claims":
+            result = unsupported_action_claim_result(
+                answer,
+                threshold=metric.threshold,
+            )
+        else:
+            result = deterministic_argument_result(
+                expected_tools=golden.expected_tools or [],
+                actual_tools=tools_called or [],
+                threshold=metric.threshold,
+            )
+
+        store.save_metric(
+            run_id,
+            case_id,
+            name,
+            status=result["status"],
+            score=result["score"],
+            threshold=metric.threshold,
+            reason=result["reason"],
+        )
+
+        score_text = (
+            "n/a" if result["score"] is None
+            else f"{result['score']:.2f}"
+        )
+        print(
+            f"    {name}: {result['status']} | "
+            f"score={score_text} — {result['reason']}"
+        )
+        return result["status"]
+
     test_case = LLMTestCase(
         input=golden.input,
         actual_output=answer,
@@ -511,6 +659,7 @@ def main():
         ]
 
     trace_metrics, single_metrics = build_metrics()
+    single_metrics.append(DeterministicUnsupportedActionClaimsMetric())
     all_metrics = trace_metrics + single_metrics
 
     run_id = args.run_id or f"run-{utc_stamp()}"
@@ -531,7 +680,7 @@ def main():
         },
     )
 
-    load_dotenv()
+    load_dotenv(dotenv_path=Path.cwd() / ".env", override=False)
     from agent.agent import agent
 
     print(f"Run ID: {run_id}")
@@ -679,14 +828,15 @@ def main():
                     )
                     continue
 
-                try:
-                    ensure_judge_available()
-                except JudgeQuotaBlocked as exc:
-                    status = save_quota_skipped_metric(
-                        store, run_id, case_id, metric, reason=str(exc)
-                    )
-                    print(f"  {name}: {status} (local quota circuit breaker)")
-                    continue
+                if not getattr(metric, "deterministic", False):
+                    try:
+                        ensure_judge_available()
+                    except JudgeQuotaBlocked as exc:
+                        status = save_quota_skipped_metric(
+                            store, run_id, case_id, metric, reason=str(exc)
+                        )
+                        print(f"  {name}: {status} (local quota circuit breaker)")
+                        continue
 
                 print(f"  Evaluating {name}...")
                 status = evaluate_single_metric(
@@ -722,8 +872,46 @@ def main():
     print(f"Run: {run_id}")
     print(f"Cases stored: {summary['cases']}")
     print(f"Metrics stored: {persisted}/{total_expected}")
+
+    print("\nMetric breakdown:")
+    for metric_name, details in sorted(
+        summary["metrics_by_name"].items()
+    ):
+        status_text = ", ".join(
+            f"{status}={count}"
+            for status, count in sorted(details["status_counts"].items())
+        ) or "no statuses"
+
+        mean_score = details["mean_score"]
+        mean_text = (
+            f"{mean_score:.4f}"
+            if mean_score is not None
+            else "n/a"
+        )
+
+        threshold = details["threshold"]
+        if threshold is not None:
+            threshold_text = f"{threshold:.2f}"
+        elif (
+            details["threshold_min"] is not None
+            and details["threshold_max"] is not None
+        ):
+            threshold_text = (
+                f"{details['threshold_min']:.2f}"
+                f"–{details['threshold_max']:.2f} (varies)"
+            )
+        else:
+            threshold_text = "n/a"
+
+        print(
+            f"  {metric_name}: {status_text} | "
+            f"cases={details['total']} | "
+            f"mean={mean_text} | threshold={threshold_text}"
+        )
+
     for status, count in sorted(summary["metric_statuses"].items()):
-        print(f"  {status}: {count}")
+        print(f"Overall {status}: {count}")
+
     print(f"Run status: {final_status}")
     print(f"Database: {Path(args.db).resolve()}")
 

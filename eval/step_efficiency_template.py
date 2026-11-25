@@ -58,5 +58,16 @@ an inefficiency.
 
 The multimodal flag is: {multimodal}
 
-Return a concise evidence-based reason.
+OUTPUT CONTRACT:
+Return ONLY one valid JSON object with exactly these two keys:
+{{
+  "score": 0.0,
+  "reason": "Concise evidence-based explanation of the score."
+}}
+
+Requirements:
+- "score" must be a number from 0.0 to 1.0.
+- "reason" must be a string.
+- Do not use "explanation" as a key.
+- Do not include Markdown fences, commentary, or additional keys.
 """
